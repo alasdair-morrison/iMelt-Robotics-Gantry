@@ -103,6 +103,39 @@ def get_cold_spot_centroid(temp_array, threshold=22.0):
         
     return None, None, None
 
+def remove_hot_spot(temp_array, h_px_x, h_px_y, radius=10):
+    """
+    Removes the hottest region above a given threshold from the thermal array
+    This is to allow for detection of multiple hot spots in the same frame, such as when a heater is on and the gantry is moving.
+    Adjustable radius allows for a larger or smaller area to be removed around the detected hot spot.
+    """
+    if h_px_x is not None and h_px_y is not None:
+        # Create a mask to zero out the hot spot region
+        mask = np.zeros_like(temp_array, dtype=np.uint8)
+        cv2.circle(mask, (int(h_px_x), int(h_px_y)), radius, 255, -1)
+        
+        # Set the hot spot region to zero in the original array
+        temp_array[mask == 255] = 0
+        
+    return temp_array
+
+def remove_cold_spot(temp_array, c_px_x, c_px_y, radius=10):
+    """
+    Removes the coldest region below a given threshold from the thermal array.
+    This is to allow for detection of multiple cold spots in the same frame, such as when a cold object is present.
+    Adjustable radius allows for a larger or smaller area to be removed around the detected cold spot.
+    """
+    
+    if c_px_x is not None and c_px_y is not None:
+        # Create a mask to zero out the cold spot region
+        mask = np.zeros_like(temp_array, dtype=np.uint8)
+        cv2.circle(mask, (int(c_px_x), int(c_px_y)), radius, 255, -1)
+        
+        # Set the cold spot region to zero in the original array
+        temp_array[mask == 255] = 0
+        
+    return temp_array
+
 def calibrate_camera_perspective(pixel_points, mm_points, filename="transform_matrix.json"):
     """
     Calculates a 3x3 transformation matrix to convert pixels to mm, 
