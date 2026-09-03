@@ -285,7 +285,7 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
                             clean_temp_array = ta.subtract_background(image_Temp, background_Temp)
                         else :
                             clean_temp_array = image_Temp
-                        max_temp, c_x, c_y = ta.get_hot_spot_centroid(clean_temp_array, threshold=0.75)
+                        max_temp, c_x, c_y = ta.get_hot_spot_centroid(image_Temp, threshold=0.75)
                         
                         # Print the data to the console
                         if max_temp is not None and c_x is not None and c_y is not None:

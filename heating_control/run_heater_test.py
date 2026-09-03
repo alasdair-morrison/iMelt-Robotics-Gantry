@@ -5,6 +5,7 @@ import math
 import threading
 import keyboard
 import numpy as np
+import tabu_controller as tc
 
 # Force Matplotlib interactive backend
 import matplotlib
