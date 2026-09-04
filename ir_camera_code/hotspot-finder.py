@@ -1,22 +1,119 @@
 import os
 import sys
+import threading
 print(sys.executable)
 import PySpin
+import time
 import matplotlib
 matplotlib.use('Qt5Agg')  # Add this line to force an interactive window
 import matplotlib.pyplot as plt
 import keyboard
 import numpy as np
 import thermal_analysis as ta
+from zaber_motion import Units
+from zaber_motion.ascii import Connection
 
+CONTINUE_RECORDING = True
+
+
+def gantryControl(x, y, z):
+    """
+    This function controls the gantry to move to points entered by the user and runs on a 
+    separate thread to allow the GUI to run in parallel.
+    """
+    global CONTINUE_RECORDING
+    while CONTINUE_RECORDING:
+        inputString= input("Enter the coordinates to move the gantry to (x, y, z) or type 'exit' to quit: ")
+        if inputString == 'exit':
+            print("Exiting gantry control thread.")
+            break
+        inputs = inputString.split(',')
+        if len(inputs) != 3:
+            if len(inputs) == 1:
+                targetX = float(inputs[0])
+                if not (0 <= targetX <= 249):
+                    print("Invalid input. Please enter coordinates within the valid range.")
+                    continue
+                else: 
+                    x.move_absolute(targetX, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+                    x.wait_until_idle()
+                    continue
+            elif len(inputs) == 2:
+                if inputs[0] == '':
+                    targetX = 0.0
+                    targetY = float(inputs[1])
+                    if not (0 <= targetY <= 99):
+                        print("Invalid input. Please enter coordinates within the valid range.")
+                        continue
+                    else:
+                        y.move_absolute(targetY, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+                        y.wait_until_idle()
+                        continue
+                targetX = float(inputs[0])
+                targetY = float(inputs[1])
+                if not (0 <= targetX <= 249 and 0 <= targetY <= 99):
+                    print("Invalid input. Please enter coordinates within the valid range.")
+                    continue
+                else:
+                    x.move_absolute(targetX, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+                    y.move_absolute(targetY, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+                    x.wait_until_idle()
+                    y.wait_until_idle()
+                    continue
+            else:
+                print("Invalid input. Please enter coordinates in the format 'x, y, z'.")
+                continue
+        else:
+            try:
+                if inputs[0] == '' and inputs[1] == '':
+                    targetX = 0.0
+                    targetY = 0.0
+                    targetZ = float(inputs[2])
+                elif inputs[1] == '':
+                    targetX = float(inputs[0])
+                    targetY = 0.0
+                    targetZ = float(inputs[2])
+                else:
+                    targetX = float(inputs[0])
+                    targetY = float(inputs[1])
+                    targetZ = float(inputs[2])
+            except ValueError:
+                print("Invalid input. Please enter coordinates in the format 'x, y, z'.")
+                continue
+        if not (0 <= targetX <= 249 and 0 <= targetY <= 99 and 0 <= targetZ <= 249):
+            print("Invalid input. Please enter coordinates within the valid range.")
+            continue
+        try:
+            if targetX == 0.0 and targetY == 0.0:
+                z.move_absolute(targetZ, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+                z.wait_until_idle()
+                continue
+            elif targetX == 0.0:
+                y.move_absolute(targetY, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+                z.move_absolute(targetZ, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+                y.wait_until_idle()
+                z.wait_until_idle()
+                continue
+            elif targetY == 0.0:
+                x.move_absolute(targetX, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+                z.move_absolute(targetZ, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+                x.wait_until_idle()
+                z.wait_until_idle()
+                continue
+            x.move_absolute(targetX, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+            y.move_absolute(targetY, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+            z.move_absolute(targetZ, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
+            x.wait_until_idle()
+            y.wait_until_idle()
+            z.wait_until_idle()
+        except ValueError:
+            print("Invalid input. Please enter coordinates in the format 'x, y, z'.")
 
 class IRFormatType:
     LINEAR_10MK = 1
     LINEAR_100MK = 2
     RADIOMETRIC = 3
 
-
-CONTINUE_RECORDING = True
 CHOSEN_IR_TYPE = IRFormatType.RADIOMETRIC
 
 
@@ -47,310 +144,168 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
     global CONTINUE_RECORDING
 
     sNodemap = cam.GetTLStreamNodeMap()
-
-    # Change bufferhandling mode to NewestOnly
     node_bufferhandling_mode = PySpin.CEnumerationPtr(sNodemap.GetNode('StreamBufferHandlingMode'))
-
     node_pixel_format = PySpin.CEnumerationPtr(nodemap.GetNode('PixelFormat'))
     node_pixel_format_mono16 = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName('Mono16'))
     pixel_format_mono16 = node_pixel_format_mono16.GetValue()
     node_pixel_format.SetIntValue(pixel_format_mono16)
 
     if CHOSEN_IR_TYPE == IRFormatType.LINEAR_10MK:
-        # This section is to be activated only to set the streaming mode to TemperatureLinear10mK
         node_IRFormat = PySpin.CEnumerationPtr(nodemap.GetNode('IRFormat'))
         node_temp_linear_high = PySpin.CEnumEntryPtr(node_IRFormat.GetEntryByName('TemperatureLinear10mK'))
-        node_temp_high = node_temp_linear_high.GetValue()
-        node_IRFormat.SetIntValue(node_temp_high)
+        node_IRFormat.SetIntValue(node_temp_linear_high.GetValue())
     elif CHOSEN_IR_TYPE == IRFormatType.LINEAR_100MK:
-        # This section is to be activated only to set the streaming mode to TemperatureLinear100mK
         node_IRFormat = PySpin.CEnumerationPtr(nodemap.GetNode('IRFormat'))
         node_temp_linear_low = PySpin.CEnumEntryPtr(node_IRFormat.GetEntryByName('TemperatureLinear100mK'))
-        node_temp_low = node_temp_linear_low.GetValue()
-        node_IRFormat.SetIntValue(node_temp_low)
+        node_IRFormat.SetIntValue(node_temp_linear_low.GetValue())
     elif CHOSEN_IR_TYPE == IRFormatType.RADIOMETRIC:
-        # This section is to be activated only to set the streaming mode to Radiometric
         node_IRFormat = PySpin.CEnumerationPtr(nodemap.GetNode('IRFormat'))
         node_temp_radiometric = PySpin.CEnumEntryPtr(node_IRFormat.GetEntryByName('Radiometric'))
-        node_radiometric = node_temp_radiometric.GetValue()
-        node_IRFormat.SetIntValue(node_radiometric)
+        node_IRFormat.SetIntValue(node_temp_radiometric.GetValue())
 
     if not PySpin.IsAvailable(node_bufferhandling_mode) or not PySpin.IsWritable(node_bufferhandling_mode):
         print('Unable to set stream buffer handling mode.. Aborting...')
         return False
 
-    # Retrieve entry node from enumeration node
     node_newestonly = node_bufferhandling_mode.GetEntryByName('NewestOnly')
     if not PySpin.IsAvailable(node_newestonly) or not PySpin.IsReadable(node_newestonly):
         print('Unable to set stream buffer handling mode.. Aborting...')
         return False
 
-    # Retrieve integer value from entry node
-    node_newestonly_mode = node_newestonly.GetValue()
-
-    # Set integer value from entry node as new value of enumeration node
-    node_bufferhandling_mode.SetIntValue(node_newestonly_mode)
+    node_bufferhandling_mode.SetIntValue(node_newestonly.GetValue())
 
     print('*** IMAGE ACQUISITION ***\n')
     try:
         node_acquisition_mode = PySpin.CEnumerationPtr(nodemap.GetNode('AcquisitionMode'))
         if not PySpin.IsAvailable(node_acquisition_mode) or not PySpin.IsWritable(node_acquisition_mode):
-            print('Unable to set acquisition mode to continuous (enum retrieval). Aborting...')
             return False
 
-        # Retrieve entry node from enumeration node
         node_acquisition_mode_continuous = node_acquisition_mode.GetEntryByName('Continuous')
-        if not PySpin.IsAvailable(node_acquisition_mode_continuous) or not PySpin.IsReadable(
-                node_acquisition_mode_continuous):
-            print('Unable to set acquisition mode to continuous (entry retrieval). Aborting...')
+        if not PySpin.IsAvailable(node_acquisition_mode_continuous) or not PySpin.IsReadable(node_acquisition_mode_continuous):
             return False
 
-        # Retrieve integer value from entry node
-        acquisition_mode_continuous = node_acquisition_mode_continuous.GetValue()
-
-        # Set integer value from entry node as new value of enumeration node
-        node_acquisition_mode.SetIntValue(acquisition_mode_continuous)
-
-        print('Acquisition mode set to continuous...')
-
-        #  Begin acquiring images
-        #
-        #  *** NOTES ***
-        #  What happens when the camera begins acquiring images depends on the
-        #  acquisition mode. Single frame captures only a single image, multi
-        #  frame catures a set number of images, and continuous captures a
-        #  continuous stream of images.
-        #
-        #  *** LATER ***
-        #  Image acquisition must be ended when no more images are needed.
+        node_acquisition_mode.SetIntValue(node_acquisition_mode_continuous.GetValue())
         cam.BeginAcquisition()
-
         print('Acquiring images...')
 
-        #  Retrieve device serial number for filename
-        #
-        #  *** NOTES ***
-        #  The device serial number is retrieved in order to keep cameras from
-        #  overwriting one another. Grabbing image IDs could also accomplish
-        #  this.
         device_serial_number = ''
         node_device_serial_number = PySpin.CStringPtr(nodemap_tldevice.GetNode('DeviceSerialNumber'))
         if PySpin.IsAvailable(node_device_serial_number) and PySpin.IsReadable(node_device_serial_number):
             device_serial_number = node_device_serial_number.GetValue()
             print('Device serial number retrieved as %s...' % device_serial_number)
 
-        # Retrieve Calibration details
-        CalibrationQueryR_node = PySpin.CFloatPtr(nodemap.GetNode('R'))
-        R = CalibrationQueryR_node.GetValue()
-        print('R =', R)
+        # Retrieve Calibration constants
+        R = PySpin.CFloatPtr(nodemap.GetNode('R')).GetValue()
+        B = PySpin.CFloatPtr(nodemap.GetNode('B')).GetValue()
+        F = PySpin.CFloatPtr(nodemap.GetNode('F')).GetValue()
+        X = PySpin.CFloatPtr(nodemap.GetNode('X')).GetValue()
+        A1 = PySpin.CFloatPtr(nodemap.GetNode('alpha1')).GetValue()
+        A2 = PySpin.CFloatPtr(nodemap.GetNode('alpha2')).GetValue()
+        B1 = PySpin.CFloatPtr(nodemap.GetNode('beta1')).GetValue()
+        B2 = PySpin.CFloatPtr(nodemap.GetNode('beta2')).GetValue()
+        J1 = PySpin.CFloatPtr(nodemap.GetNode('J1')).GetValue()
+        J0 = PySpin.CIntegerPtr(nodemap.GetNode('J0')).GetValue()
 
-        CalibrationQueryB_node = PySpin.CFloatPtr(nodemap.GetNode('B'))
-        B = CalibrationQueryB_node.GetValue()
-        print('B =', B)
-
-        CalibrationQueryF_node = PySpin.CFloatPtr(nodemap.GetNode('F'))
-        F = CalibrationQueryF_node.GetValue()
-        print('F =', F)
-
-        CalibrationQueryX_node = PySpin.CFloatPtr(nodemap.GetNode('X'))
-        X = CalibrationQueryX_node.GetValue()
-        print('X =', X)
-
-        CalibrationQueryA1_node = PySpin.CFloatPtr(nodemap.GetNode('alpha1'))
-        A1 = CalibrationQueryA1_node.GetValue()
-        print('alpha1 =', A1)
-
-        CalibrationQueryA2_node = PySpin.CFloatPtr(nodemap.GetNode('alpha2'))
-        A2 = CalibrationQueryA2_node.GetValue()
-        print('alpha2 =', A2)
-
-        CalibrationQueryB1_node = PySpin.CFloatPtr(nodemap.GetNode('beta1'))
-        B1 = CalibrationQueryB1_node.GetValue()
-        print('beta1 =', B1)
-
-        CalibrationQueryB2_node = PySpin.CFloatPtr(nodemap.GetNode('beta2'))
-        B2 = CalibrationQueryB2_node.GetValue()
-        print('beta2 =', B2)
-
-        CalibrationQueryJ1_node = PySpin.CFloatPtr(nodemap.GetNode('J1'))    # Gain
-        J1 = CalibrationQueryJ1_node.GetValue()
-        print('Gain =', J1)
-
-        CalibrationQueryJ0_node = PySpin.CIntegerPtr(nodemap.GetNode('J0'))   # Offset
-        J0 = CalibrationQueryJ0_node.GetValue()
-        print('Offset =', J0)
-
-        # Figure(1) is default so you can omit this line. Figure(0) will create a new window every time program hits this line
-        fig = plt.figure(1)
-
-        # Close the GUI when close event happens
+        # Initialize interactive plot once outside the loop
+        plt.ion()
+        fig, ax = plt.subplots(figsize=(9, 7))
+        fig.suptitle('A700 Temperature Radiometric', fontsize=12, weight='bold')
         fig.canvas.mpl_connect('close_event', handle_close)
+        
+        # Adjust subplot bottom margin so HUD text does not overlap with axes or colorbar
+        fig.subplots_adjust(bottom=0.15)
+
+        im_display = None
+        cbar = None
+        hot_marker, = ax.plot([], [], marker='+', color='red', markersize=16, markeredgewidth=2)
+
+        # Visually distinct text overlays:
+        # 1. Pixel/Relative coordinates (upper line, muted neutral styling)
+        pixel_text = fig.text(0.5, 0.07, '', ha='center', va='center', fontsize=9, color='#555555')
+        # 2. Real-World Gantry coordinates (bottom line, highlighted bold box)
+        real_world_text = fig.text(
+            0.5, 0.025, '', ha='center', va='center', fontsize=10, weight='bold', color='#004C99',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='#EBF3FB', edgecolor='#B3D1FF', alpha=0.9)
+        )
 
         if CHOSEN_IR_TYPE == IRFormatType.RADIOMETRIC:
-            # Object Parameters. For this demo, they are imposed!
-            # This section is important when the streaming is set to radiometric and not TempLinear
-            # Image of temperature is calculated computer-side and not camera-side
-            # Parameters can be set to the whole image, or for a particular ROI (not done here)
-            Emiss = 0.97
-            TRefl = 293.15
-            TAtm = 293.15
-            TAtmC = TAtm - 273.15
-            Humidity = 0.55
-
-            Dist = 2
-            ExtOpticsTransmission = 1
+            Emiss, TRefl, TAtm, Humidity = 0.97, 293.15, 293.15, 0.55
+            Dist, ExtOpticsTransmission = 2, 1
             ExtOpticsTemp = TAtm
-
-            H2O = Humidity * np.exp(1.5587 + 0.06939 * TAtmC - 0.00027816 * TAtmC * TAtmC + 0.00000068455 * TAtmC * TAtmC * TAtmC)
-            print('H20 =', H2O)
-
+            TAtmC = TAtm - 273.15
+            H2O = Humidity * np.exp(1.5587 + 0.06939 * TAtmC - 0.00027816 * TAtmC**2 + 0.00000068455 * TAtmC**3)
             Tau = X * np.exp(-np.sqrt(Dist) * (A1 + B1 * np.sqrt(H2O))) + (1 - X) * np.exp(-np.sqrt(Dist) * (A2 + B2 * np.sqrt(H2O)))
-            print('tau =', Tau)
-
-            # Pseudo radiance of the reflected environment
             r1 = ((1 - Emiss) / Emiss) * (R / (np.exp(B / TRefl) - F))
-            print('r1 =', r1)
-
-            # Pseudo radiance of the atmosphere
             r2 = ((1 - Tau) / (Emiss * Tau)) * (R / (np.exp(B / TAtm) - F))
-            print('r2 =', r2)
-
-            # Pseudo radiance of the external optics
             r3 = ((1 - ExtOpticsTransmission) / (Emiss * Tau * ExtOpticsTransmission)) * (R / (np.exp(B / ExtOpticsTemp) - F))
-            print('r3 =', r3)
-
             K2 = r1 + r2 + r3
-            print('K2 =', K2)
-        if os.path.exists("background.npy"):
-            background_Temp = ta.load_background(filename="background.npy")  # Load the background frame from a .npy file if it exists
-        else:
-            background_Temp = None
-        if os.path.exists("transform_matrix.json"):
-                                    transform_matrix = ta.load_transform_matrix("transform_matrix.json")
-        else:
-            transform_matrix = None
-        # Retrieve and display images
-        print('Press Enter to stop streaming')
-        while(CONTINUE_RECORDING):
+
+        background_Temp = ta.load_background(filename="background.npy") if os.path.exists("background.npy") else None
+        transform_matrix = ta.load_transform_matrix("transform_matrix.json") if os.path.exists("transform_matrix.json") else None
+
+        print('Press Q to stop streaming')
+
+        while CONTINUE_RECORDING:
             try:
+                image_result = cam.GetNextImage(1000)
 
-                #  Retrieve next received image
-                #
-                #  *** NOTES ***
-                #  Capturing an image houses images on the camera buffer. Trying
-                #  to capture an image that does not exist will hang the camera.
-                #
-                #  *** LATER ***
-                #  Once an image from the buffer is saved and/or no longer
-                #  needed, the image must be released in order to keep the
-                #  buffer from filling up.
-
-                image_result = cam.GetNextImage()
-
-                #  Ensure image completion
                 if image_result.IsIncomplete():
-                    print('Image incomplete with image status %d ...' % image_result.GetImageStatus())
-
+                    print('Image incomplete with status %d...' % image_result.GetImageStatus())
                 else:
-
-                    # Getting the image data as a np array
                     image_data = image_result.GetNDArray()
 
-                    # Draws an image (data, TemperatureLinear10mK, TemperatureLinear100mK, TemperatureRadiometric on the current figure.
-                    # Select the desired output first
-
-                    # Adapt the title to the correct streaming mode: TempLinear10mK, or TempLinear100mK or pseudo Radiance or Temperature Radiometric
-                    fig.suptitle('A700 Temperature Radiometric')
-
                     if CHOSEN_IR_TYPE == IRFormatType.LINEAR_10MK:
-                        # Transforming the data array into a temperature array, if streaming mode is set to TemperatueLinear10mK
-                        image_Temp_Celsius_high = (image_data * 0.01) - 273.15
-                        # Displaying an image of temperature when streaming mode is set to TemperatureLinear10mK
-                        plt.imshow(image_Temp_Celsius_high, cmap='inferno', aspect='auto')
-                        plt.colorbar(format='%.2f')
-
+                        display_data = (image_data * 0.01) - 273.15
                     elif CHOSEN_IR_TYPE == IRFormatType.LINEAR_100MK:
-                        # Transforming the data array into a temperature array, if streaming mode is set to TemperatureLinear100mK
-                        image_Temp_Celsius_low = (image_data * 0.1) - 273.15
-                        # Displaying an image of temperature when streaming mode is set to TemperatureLinear100mK
-                        plt.imshow(image_Temp_Celsius_low, cmap='inferno', aspect='auto')
-                        plt.colorbar(format='%.2f')
-
+                        display_data = (image_data * 0.1) - 273.15
                     elif CHOSEN_IR_TYPE == IRFormatType.RADIOMETRIC:
-                        # Transforming the data array into a pseudo radiance array, if streaming mode is set to Radiometric.
-                        # and then calculating the temperature array (degrees Celsius) with the full thermography formula
                         image_Radiance = (image_data - J0) / J1
                         image_Temp = (B / np.log(R / ((image_Radiance / Emiss / Tau) - K2) + F)) - 273.15
-                        if background_Temp is not None:
-                            clean_temp_array = ta.subtract_background(image_Temp, background_Temp)
-                        else :
-                            clean_temp_array = image_Temp
-                        max_temp, c_x, c_y = ta.get_hot_spot_centroid(image_Temp, threshold=0.75)
+                        clean_temp_array = ta.subtract_background(image_Temp, background_Temp) if background_Temp is not None else image_Temp
                         
-                        # Print the data to the console
+                        max_temp, c_x, c_y = ta.get_hot_spot_centroid(clean_temp_array, threshold=0.75)
+                        display_data = image_Temp
+
+                        # Update relative pixel coordinates
                         if max_temp is not None and c_x is not None and c_y is not None:
-                            print(f"Hottest: {max_temp:.2f}°C at (X:{c_x}, Y:{c_y})")
-                        else: 
-                            print("No hot spot found above the threshold.")
-                        if transform_matrix is not None:
-                            hot_real_world = ta.get_mm_from_pixels(c_x, c_y, transform_matrix)
+                            pixel_text.set_text(f"Relative (Pixels): X = {c_x:.1f} px, Y = {c_y:.1f} px  |  Peak: {max_temp:.2f} °C")
+                            hot_marker.set_data([c_x], [c_y])
                         else:
-                            hot_real_world = (None, None)       
-                        print(f"Hottest real-world coordinates: {hot_real_world}")
-                        # Displaying an image of temperature (degrees Celsius) when streaming mode is set to Radiometric
-                        plt.imshow(image_Temp, cmap='inferno', aspect='auto')
-                        plt.colorbar(format='%.2f')
-                        
-                        # Plot a red crosshair on the hottest spot
-                        if c_x is not None and c_y is not None:
-                            plt.plot(c_x, c_y, marker='+', color='red', markersize=15, markeredgewidth=2)
-                        
-                        # Plot a blue crosshair on the coldest spot
-                        #plt.plot(cold_data[1], cold_data[2], marker='+', color='cyan', markersize=15, markeredgewidth=2)
+                            pixel_text.set_text("Relative (Pixels): No hot spot detected above threshold")
+                            hot_marker.set_data([], [])
 
-                        '''
-                        # Displaying an image of counts when streaming mode is set to Radiometric
-                        plt.imshow(image_data, cmap='inferno', aspect='auto')
-                        plt.colorbar(format='%.2f')
-                        '''
-                        '''
-                        # Displaying an image of pseudo radiance when streaming mode is set to Radiometric
-                        plt.imshow(image_Radiance, cmap='inferno', aspect='auto')
-                        plt.colorbar(format='%.2f')
-                        '''
+                        # Update real-world gantry coordinates
+                        if transform_matrix is not None and c_x is not None and c_y is not None:
+                            hot_real_world = ta.get_mm_from_pixels(c_x, c_y, transform_matrix)
+                            real_world_text.set_text(f"Real-World (Gantry): X = {hot_real_world[0]:.2f} mm,  Y = {hot_real_world[1]:.2f} mm")
+                        else:
+                            real_world_text.set_text("Real-World (Gantry): Calibration Matrix Unavailable")
 
-                    # Interval in plt.pause(interval) determines how fast the images are displayed in a GUI
-                    # Interval is in seconds.
-                    plt.pause(0.001)
+                    # Draw / update image array in-place without rebuilding axes
+                    if im_display is None:
+                        im_display = ax.imshow(display_data, cmap='inferno', aspect='auto')
+                        cbar = fig.colorbar(im_display, ax=ax, format='%.2f')
+                        cbar.set_label('Temperature (°C)', rotation=270, labelpad=15)
+                    else:
+                        im_display.set_data(display_data)
+                        im_display.set_clim(vmin=float(np.min(display_data)), vmax=float(np.max(display_data)))
 
-                    # Clear current reference of a figure. This will improve display speed significantly
-                    plt.clf()
+                    # Process GUI events without raising the window or stealing focus
+                    fig.canvas.draw_idle()
+                    fig.canvas.flush_events()
+                    time.sleep(0.001)
 
-                    # If user presses enter, close the program
-                    if keyboard.is_pressed('ENTER'):
+                    if keyboard.is_pressed('q'):
                         print('Program is closing...')
-
-                        # Close figure
                         plt.close('all')
                         CONTINUE_RECORDING = False
 
-                #  Release image
-                #
-                #  *** NOTES ***
-                #  Images retrieved directly from the camera (i.e. non-converted
-                #  images) need to be released in order to keep from filling the
-                #  buffer.
                 image_result.Release()
 
             except PySpin.SpinnakerException as ex:
                 print('Error: %s' % ex)
                 return False
 
-        #  End acquisition
-        #
-        #  *** NOTES ***
-        #  Ending acquisition appropriately helps ensure that devices clean up
-        #  properly and do not need to be power-cycled to maintain integrity.
         cam.EndAcquisition()
 
     except PySpin.SpinnakerException as ex:
@@ -435,8 +390,32 @@ def main():
     for i, cam in enumerate(cam_list):
 
         print('Running example for camera %d...' % i)
+        try:
+                with Connection.open_serial_port("COM6") as connection:
+                    connection.enable_alerts()
+                    device_list = connection.detect_devices()
+                    device = device_list[0]
+                    y = device_list[1].get_axis(1)
+                    x = device.get_axis(1)
+                    z = device.get_axis(2)
+                    
+                    print("[MOTION] Homing Gantry...")
+                    if not x.is_homed(): x.home(wait_until_idle=False)
+                    if not y.is_homed(): y.home(wait_until_idle=False)
+                    if not z.is_homed(): z.home(wait_until_idle=False)
+                    x.wait_until_idle()
+                    y.wait_until_idle()
+                    z.wait_until_idle()
+                    
+                    # Start the background gantry thread
+                    gantry_thread = threading.Thread(target=gantryControl, args=(x, y, z), daemon=True)
+                    gantry_thread.start()
 
-        result &= run_single_camera(cam)
+                    result &= run_single_camera(cam)
+
+        except Exception as e:
+            print(f"Error occurred while setting up gantry: {e}")
+                
         print('Camera %d example complete... \n' % i)
 
     # Release reference to camera
