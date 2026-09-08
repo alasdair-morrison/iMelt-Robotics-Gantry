@@ -245,7 +245,7 @@ def calibrate_with_checkerboard(image_array, board_dims=(7, 7), square_size_mm=3
             json.dump(matrix.tolist(), f)
             
         print("Checkerboard calibration complete. Matrix saved.")
-        return matrix
+        return True
     else:
         print("Failed to detect checkerboard. Ensure the thermal contrast is high enough.")
         return None

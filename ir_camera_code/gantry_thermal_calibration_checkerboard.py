@@ -31,7 +31,7 @@ def handle_close(evt):
     CONTINUE_RECORDING = False
 
 
-def acquire_and_display_images(cam, nodemap, nodemap_tldevice, x, y):
+def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
     """
     This function continuously acquires images from a device and display them in a GUI.
 
@@ -255,34 +255,33 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice, x, y):
                 #  Once an image from the buffer is saved and/or no longer
                 #  needed, the image must be released in order to keep the
                 #  buffer from filling up.
-                for iteration in range(1, 5):  # Move to 4 different positions for calibration
+                image_result = cam.GetNextImage()
 
-                    image_result = cam.GetNextImage()
+                #  Ensure image completion
+                if image_result.IsIncomplete():
+                    print('Image incomplete with image status %d ...' % image_result.GetImageStatus())
 
-                    #  Ensure image completion
-                    if image_result.IsIncomplete():
-                        print('Image incomplete with image status %d ...' % image_result.GetImageStatus())
+                else:
 
-                    else:
+                    # Getting the image data as a np array
+                    image_data = image_result.GetNDArray()
 
-                        # Getting the image data as a np array
-                        image_data = image_result.GetNDArray()
+                    if CHOSEN_IR_TYPE == IRFormatType.RADIOMETRIC:
+                        # Transforming the data array into a pseudo radiance array, if streaming mode is set to Radiometric.
+                        # and then calculating the temperature array (degrees Celsius) with the full thermography formula
+                        image_Radiance = (image_data - J0) / J1
+                        image_Temp = (B / np.log(R / ((image_Radiance / Emiss / Tau) - K2) + F)) - 273.15
 
-                        if CHOSEN_IR_TYPE == IRFormatType.RADIOMETRIC:
-                            # Transforming the data array into a pseudo radiance array, if streaming mode is set to Radiometric.
-                            # and then calculating the temperature array (degrees Celsius) with the full thermography formula
-                            image_Radiance = (image_data - J0) / J1
-                            image_Temp = (B / np.log(R / ((image_Radiance / Emiss / Tau) - K2) + F)) - 273.15
-
-                            ta.calibrate_with_checkerboard(image_Temp, board_dims=(10, 8), square_size_mm=30.0)
-
-                            # If user presses enter, close the program
-                            if keyboard.is_pressed('ENTER'):
-                                print('Program is closing...')
-        
-                                # Close figure
-                                # plt.close('all')
-                                CONTINUE_RECORDING = False
+                        success = ta.calibrate_with_checkerboard(image_Temp, board_dims=(10, 8), square_size_mm=30.0)
+                        if success:
+                            CONTINUE_RECORDING = False
+                        # If user presses enter, close the program
+                        if keyboard.is_pressed('ENTER'):
+                            print('Program is closing...')
+    
+                            # Close figure
+                            # plt.close('all')
+                            CONTINUE_RECORDING = False
                 #  Release image
                 #
                 #  *** NOTES ***
@@ -309,7 +308,7 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice, x, y):
     return True
 
 
-def run_single_camera(cam, x, y):
+def run_single_camera(cam):
     """
     This function acts as the body of the example; please see NodeMapInfo example
     for more in-depth comments on setting up cameras.
@@ -331,7 +330,7 @@ def run_single_camera(cam, x, y):
         nodemap = cam.GetNodeMap()
 
         # Acquire images
-        result &= acquire_and_display_images(cam, nodemap, nodemap_tldevice, x, y)
+        result &= acquire_and_display_images(cam, nodemap, nodemap_tldevice)
 
         # Deinitialize camera
         cam.DeInit()
@@ -384,34 +383,8 @@ def main():
     for i, cam in enumerate(cam_list):
 
         print('Running calibration for camera ...')
-        with Connection.open_serial_port("COM6") as connection:
-            connection.enable_alerts()
-
-            device_list = connection.detect_devices()
-            print("Found {} devices".format(len(device_list)))
-            device = device_list[0]
-            print("Device has {} axes".format(device.axis_count))
-            x = device.get_axis(1)
-            y = device.get_axis(2)
-            # Home the axis if it is not already homed (just means check if the axis is at its reference position)
-            if not x.is_homed():
-                print("Axis 1 is not homed. Homing now...")
-                x.home(wait_until_idle=False)
-            
-            if not y.is_homed():
-                print("Axis 2 is not homed. Homing now...")
-                y.home(wait_until_idle=False)
-            x.wait_until_idle()
-            y.wait_until_idle()
-            result &= run_single_camera(cam, x, y)
-            x.move_absolute(0, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
-            y.move_absolute(0, Units.LENGTH_MILLIMETRES, wait_until_idle=False)
-            x.wait_until_idle()
-            y.wait_until_idle()
+        result &= run_single_camera(cam)
         print('Camera calibration complete... \n')
-        print(f'Pixel coordinates of hot spots: {pixel_cords}')
-        print(f'Physical coordinates of hot spots: {physical_cords}')
-        conversion_matrix = ta.calibrate_camera_perspective(pixel_cords, physical_cords)
     # Release reference to camera
     # NOTE: Unlike the C++ examples, we cannot rely on pointer objects being automatically
     # cleaned up when going out of scope.
