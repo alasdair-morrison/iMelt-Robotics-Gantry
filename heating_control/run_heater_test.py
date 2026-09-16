@@ -30,14 +30,15 @@ state_lock = threading.Lock()
 CONTINUE_RECORDING = True
 
 GLOBAL_THERMAL_STATE = {
-    'target_temp': 180.0,
+    'target_temp': 50.0,
     'current_min_temp': 25.0,
     'cold_centroid': None,  # (mm_x, mm_y)
     'hot_centroid': None,   # (mm_x, mm_y)
     'cold_centroids': [],  # List of (mm_x, mm_y) for multiple cold points
     'hot_centroids': [],   # List of (mm_x, mm_y) for multiple hot points
     'hotspot_intensity': 0.0,
-    'raw_temp_frame': None 
+    'raw_temp_frame': None,
+    'gantry_position': (0.0, 0.0)  # (mm_x, mm_y)
 }
 
 # Define target curing temp and safety ceiling threshold
@@ -95,6 +96,9 @@ def execute_constant_velocity_spiral(axis_x, axis_y, max_radius=120.0, pitch=15.
         axis_y.move_velocity(v_y, Units.VELOCITY_MILLIMETRES_PER_SECOND)
         
         theta += theta_dot * LOOP_DELAY
+        curr_x = axis_x.get_position(Units.LENGTH_MILLIMETRES)
+        curr_y = axis_y.get_position(Units.LENGTH_MILLIMETRES)
+        update_thermal_state({'gantry_position': (curr_x, curr_y)})
         time.sleep(LOOP_DELAY)
         
     axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
@@ -103,70 +107,64 @@ def execute_constant_velocity_spiral(axis_x, axis_y, max_radius=120.0, pitch=15.
 tabuFlowController = tc.ThermalTabuFlowController(grid_size=(250, 250), tabu_duration=8.0)
 
 def reactive_thermal_loop(axis_x, axis_y):
-    """Closed-loop phase. Steers via potential fields and modulates speed based on thermal error."""
     print("[MOTION] Entering Reactive Heating Phase...")
     logger = SystemLogger(subfolder="telemetry_data/run_tests")
     prev_error = 0.0
-    
-    # Start tracking physical location from the end of the spiral
-    curr_x = axis_x.get_position(Units.LENGTH_MILLIMETRES)
-    curr_y = axis_y.get_position(Units.LENGTH_MILLIMETRES)
+
     try:
         while CONTINUE_RECORDING:
-            state = get_thermal_state()
-            raw_temp_array = state['raw_temp_frame']
-            if raw_temp_array is None:
-                time.sleep(LOOP_DELAY)
-                continue
+            # Query physical hardware position
+            curr_x = axis_x.get_position(Units.LENGTH_MILLIMETRES)
+            curr_y = axis_y.get_position(Units.LENGTH_MILLIMETRES)
 
-            # Update Tabu Memory with current gantry position
-            tabuFlowController.update_tabu_memory(curr_x, curr_y, radius=15.0, dt=LOOP_DELAY)
-            # Compute flow vector based on current thermal state
-            
-            heading_x, heading_y = tabuFlowController.compute_flow_vector(raw_temp_array, curr_x, curr_y, target_temp=state['target_temp'])
-            # If the entire board has reached target temp, hold position
-            if np.min(raw_temp_array) >= (state['target_temp'] - 5.0):
-                axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-                axis_y.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-                time.sleep(LOOP_DELAY)
-                continue
-            # If no valid thermal signatures are detected, hold position
-            # We rely on the thermal deficit check here instead of the centroids
-            if np.max(raw_temp_array) < 30.0 and np.min(raw_temp_array) > (state['target_temp'] - 5.0):
-                axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-                axis_y.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-                time.sleep(LOOP_DELAY)
-                continue
-                
-            # --- PD Feedrate Control ---
+            state = get_thermal_state()
+            cold_pos = state.get('cold_centroid')
+            hot_pos = state.get('hot_centroid')
+            hot_intensity = state.get('hotspot_intensity', 0.0)
+
+            # Update Tabu memory and calculate heading
+            tabuFlowController.update_tabu_memory(curr_x, curr_y, radius=20.0, dt=LOOP_DELAY)
+            heading_x, heading_y = tabuFlowController.compute_nav_vector(
+                curr_x, curr_y,
+                cold_target=cold_pos,
+                hot_target=hot_pos,
+                hot_intensity=hot_intensity
+            )
+
+            # PD Speed Modulation
             error = state['target_temp'] - state['current_min_temp']
             error_derivative = (error - prev_error) / LOOP_DELAY
             prev_error = error
-            
+
             modulated_speed = BASE_SPEED - (K_p * error) + (K_d * error_derivative)
             current_speed = max(MIN_SPEED, min(MAX_SPEED, modulated_speed))
-            
-            # --- Boundary Safety Limits ---
-            if curr_x <= 5.0 and heading_x < 0: heading_x = 0
-            if curr_x >= (MAX_X - 5.0) and heading_x > 0: heading_x = 0
-            if curr_y <= 5.0 and heading_y < 0: heading_y = 0
-            if curr_y >= (MAX_Y - 5.0) and heading_y > 0: heading_y = 0
-            
-            # --- Stream Kinematics ---
+
+            # Tangential Wall Sliding (zero only the blocked axis, preserve the other)
+            if (curr_x <= 5.0 and heading_x < 0) or (curr_x >= (MAX_X - 5.0) and heading_x > 0):
+                heading_x = 0.0
+            if (curr_y <= 5.0 and heading_y < 0) or (curr_y >= (MAX_Y - 5.0) and heading_y > 0):
+                heading_y = 0.0
+
+            # Re-normalize heading if one axis remains active
+            rem_mag = math.hypot(heading_x, heading_y)
+            if rem_mag > 1e-4:
+                heading_x /= rem_mag
+                heading_y /= rem_mag
+            else:
+                heading_x, heading_y = 0.0, 0.0
+
+            # Stream velocities
             command_vx = heading_x * current_speed
             command_vy = heading_y * current_speed
-            print(f"[MOTION] Flow Vector: ({heading_x:.2f}, {heading_y:.2f}) | Speed: {current_speed:.2f} mm/s")
-            
+
             axis_x.move_velocity(command_vx, Units.VELOCITY_MILLIMETRES_PER_SECOND)
             axis_y.move_velocity(command_vy, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-            
-            curr_x += command_vx * LOOP_DELAY
-            curr_y += command_vy * LOOP_DELAY
-            # Record iteration data
+
             logger.log_step(curr_x, curr_y, command_vx, command_vy, current_speed,
                             heading_x, heading_y, state, error, error_derivative)
+            update_thermal_state({'gantry_position': (curr_x, curr_y)})
             time.sleep(LOOP_DELAY)
-            time.sleep(LOOP_DELAY)
+
     finally:
         logger.close()
 
@@ -240,6 +238,7 @@ def reactive_thermal_loop_multipoint(axis_x, axis_y):
         
         curr_x += command_vx * LOOP_DELAY
         curr_y += command_vy * LOOP_DELAY
+        update_thermal_state({'gantry_position': (curr_x, curr_y)})
         time.sleep(LOOP_DELAY)
 
 def gantry_worker(x, y):
@@ -361,10 +360,22 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
                     # Apply Radiometric Math
                     image_Radiance = (image_data - J0) / J1
                     image_Temp = (B / np.log(R / ((image_Radiance / Emiss / Tau) - K2) + F)) - 273.15
+                    # Identify the superheated core of the induction head
+                    heater_core_mask = (image_Temp >= COIL_TEMP_CEILING).astype(np.uint8)
                     
+                    # Dilate to swallow the 3D physical body & thermal halo
+                    kernel = np.ones((55, 55), np.uint8)
+                    full_heater_mask = cv2.dilate(heater_core_mask, kernel, iterations=1)
+                    
+                    # Calculate the mean temperature of the UNMASKED board
+                    valid_pixels = image_Temp[full_heater_mask == 0]
+                    neutral_temp = float(np.mean(valid_pixels)) if len(valid_pixels) > 0 else 25.0
+                    
+                    # Fill the heater footprint with the neutral average
+                    clean_temp_array = np.where(full_heater_mask == 1, neutral_temp, image_Temp)
                     # Find Centroids
-                    hot_max, h_px_x, h_px_y = ta.get_hot_spot_centroid(image_Temp, threshold=50.0, max_temp_cutoff=COIL_TEMP_CEILING, roi_mask=roi_mask)
-                    cold_min, c_px_x, c_px_y = ta.get_cold_spot_centroid(image_Temp, threshold=0.15, roi_mask=roi_mask)
+                    hot_max, h_px_x, h_px_y = ta.get_hot_spot_centroid(clean_temp_array, threshold=50.0, max_temp_cutoff=COIL_TEMP_CEILING, roi_mask=roi_mask)
+                    cold_min, c_px_x, c_px_y = ta.get_cold_spot_centroid(clean_temp_array, threshold=0.15, roi_mask=roi_mask)
                     # Warp the 480x640 camera pixels into a 250x250 physical mm grid
                     physical_bed_map = cv2.warpPerspective(image_Temp, transform_matrix, (250, 250))
                     if hot_max is not None:
@@ -538,8 +549,8 @@ def main():
             y = device.get_axis(2)
             
             print("[MOTION] Homing Gantry...")
-            if not x.is_homed(): x.home(wait_until_idle=False)
-            if not y.is_homed(): y.home(wait_until_idle=False)
+            x.home(wait_until_idle=False)
+            y.home(wait_until_idle=False)
             x.wait_until_idle()
             y.wait_until_idle()
             
