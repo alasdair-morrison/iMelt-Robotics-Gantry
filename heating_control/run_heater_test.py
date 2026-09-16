@@ -7,7 +7,7 @@ import keyboard
 import numpy as np
 import tabu_controller as tc
 import cv2
-
+from system_logger import SystemLogger
 # Force Matplotlib interactive backend
 import matplotlib
 matplotlib.use('Qt5Agg')  
@@ -105,64 +105,70 @@ tabuFlowController = tc.ThermalTabuFlowController(grid_size=(250, 250), tabu_dur
 def reactive_thermal_loop(axis_x, axis_y):
     """Closed-loop phase. Steers via potential fields and modulates speed based on thermal error."""
     print("[MOTION] Entering Reactive Heating Phase...")
+    logger = SystemLogger(subfolder="telemetry_data/run_tests")
     prev_error = 0.0
     
     # Start tracking physical location from the end of the spiral
     curr_x = axis_x.get_position(Units.LENGTH_MILLIMETRES)
     curr_y = axis_y.get_position(Units.LENGTH_MILLIMETRES)
-    
-    while CONTINUE_RECORDING:
-        state = get_thermal_state()
-        raw_temp_array = state['raw_temp_frame']
-        if raw_temp_array is None:
-            time.sleep(LOOP_DELAY)
-            continue
+    try:
+        while CONTINUE_RECORDING:
+            state = get_thermal_state()
+            raw_temp_array = state['raw_temp_frame']
+            if raw_temp_array is None:
+                time.sleep(LOOP_DELAY)
+                continue
 
-        # Update Tabu Memory with current gantry position
-        tabuFlowController.update_tabu_memory(curr_x, curr_y, radius=15.0, dt=LOOP_DELAY)
-        # Compute flow vector based on current thermal state
-        
-        heading_x, heading_y = tabuFlowController.compute_flow_vector(raw_temp_array, curr_x, curr_y, target_temp=state['target_temp'])
-        # If the entire board has reached target temp, hold position
-        if np.min(raw_temp_array) >= (state['target_temp'] - 5.0):
-            axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-            axis_y.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-            time.sleep(LOOP_DELAY)
-            continue
-        # If no valid thermal signatures are detected, hold position
-        # We rely on the thermal deficit check here instead of the centroids
-        if np.max(raw_temp_array) < 30.0 and np.min(raw_temp_array) > (state['target_temp'] - 5.0):
-            axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-            axis_y.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-            time.sleep(LOOP_DELAY)
-            continue
+            # Update Tabu Memory with current gantry position
+            tabuFlowController.update_tabu_memory(curr_x, curr_y, radius=15.0, dt=LOOP_DELAY)
+            # Compute flow vector based on current thermal state
             
-        # --- PD Feedrate Control ---
-        error = state['target_temp'] - state['current_min_temp']
-        error_derivative = (error - prev_error) / LOOP_DELAY
-        prev_error = error
-        
-        modulated_speed = BASE_SPEED - (K_p * error) + (K_d * error_derivative)
-        current_speed = max(MIN_SPEED, min(MAX_SPEED, modulated_speed))
-        
-        # --- Boundary Safety Limits ---
-        if curr_x <= 5.0 and heading_x < 0: heading_x = 0
-        if curr_x >= (MAX_X - 5.0) and heading_x > 0: heading_x = 0
-        if curr_y <= 5.0 and heading_y < 0: heading_y = 0
-        if curr_y >= (MAX_Y - 5.0) and heading_y > 0: heading_y = 0
-        
-        # --- Stream Kinematics ---
-        command_vx = heading_x * current_speed
-        command_vy = heading_y * current_speed
-        print(f"[MOTION] Flow Vector: ({heading_x:.2f}, {heading_y:.2f}) | Speed: {current_speed:.2f} mm/s")
-        
-        axis_x.move_velocity(command_vx, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-        axis_y.move_velocity(command_vy, Units.VELOCITY_MILLIMETRES_PER_SECOND)
-        
-        curr_x += command_vx * LOOP_DELAY
-        curr_y += command_vy * LOOP_DELAY
-        time.sleep(LOOP_DELAY)
-        time.sleep(LOOP_DELAY)
+            heading_x, heading_y = tabuFlowController.compute_flow_vector(raw_temp_array, curr_x, curr_y, target_temp=state['target_temp'])
+            # If the entire board has reached target temp, hold position
+            if np.min(raw_temp_array) >= (state['target_temp'] - 5.0):
+                axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
+                axis_y.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
+                time.sleep(LOOP_DELAY)
+                continue
+            # If no valid thermal signatures are detected, hold position
+            # We rely on the thermal deficit check here instead of the centroids
+            if np.max(raw_temp_array) < 30.0 and np.min(raw_temp_array) > (state['target_temp'] - 5.0):
+                axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
+                axis_y.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
+                time.sleep(LOOP_DELAY)
+                continue
+                
+            # --- PD Feedrate Control ---
+            error = state['target_temp'] - state['current_min_temp']
+            error_derivative = (error - prev_error) / LOOP_DELAY
+            prev_error = error
+            
+            modulated_speed = BASE_SPEED - (K_p * error) + (K_d * error_derivative)
+            current_speed = max(MIN_SPEED, min(MAX_SPEED, modulated_speed))
+            
+            # --- Boundary Safety Limits ---
+            if curr_x <= 5.0 and heading_x < 0: heading_x = 0
+            if curr_x >= (MAX_X - 5.0) and heading_x > 0: heading_x = 0
+            if curr_y <= 5.0 and heading_y < 0: heading_y = 0
+            if curr_y >= (MAX_Y - 5.0) and heading_y > 0: heading_y = 0
+            
+            # --- Stream Kinematics ---
+            command_vx = heading_x * current_speed
+            command_vy = heading_y * current_speed
+            print(f"[MOTION] Flow Vector: ({heading_x:.2f}, {heading_y:.2f}) | Speed: {current_speed:.2f} mm/s")
+            
+            axis_x.move_velocity(command_vx, Units.VELOCITY_MILLIMETRES_PER_SECOND)
+            axis_y.move_velocity(command_vy, Units.VELOCITY_MILLIMETRES_PER_SECOND)
+            
+            curr_x += command_vx * LOOP_DELAY
+            curr_y += command_vy * LOOP_DELAY
+            # Record iteration data
+            logger.log_step(curr_x, curr_y, command_vx, command_vy, current_speed,
+                            heading_x, heading_y, state, error, error_derivative)
+            time.sleep(LOOP_DELAY)
+            time.sleep(LOOP_DELAY)
+    finally:
+        logger.close()
 
 def reactive_thermal_loop_multipoint(axis_x, axis_y):
     """Closed-loop phase with multiple thermal points. Steers via potential fields and modulates speed based on thermal error."""
