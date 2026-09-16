@@ -1,4 +1,5 @@
 import numpy as np
+import cv2
 
 class ThermalTabuFlowController:
     def __init__(self, grid_size=(250, 250), tabu_duration=8.0):
@@ -26,14 +27,21 @@ class ThermalTabuFlowController:
         # Create Potential Field (Attractive = Cold Deficit, Repulsive = Hot Spots)
         repulsion = np.maximum(0.0, temp_array - (target_temp - 10.0)) ** 2
         potential = -active_deficit + (2.0 * repulsion)
+
+        # This tilts the flat Tabu plateau towards the deepest cold valleys
+        smoothed_potential = cv2.GaussianBlur(potential.astype(np.float32), (0, 0), sigmaX=15.0)
         
         # Generate Vector Flow Field via Spatial Gradients
-        grad_y, grad_x = np.gradient(potential)
+        grad_y, grad_x = np.gradient(smoothed_potential)
         
         # Sample Flow Vector at current gantry position
         gx, gy = int(np.clip(curr_x, 0, 249)), int(np.clip(curr_y, 0, 249))
         vx = -grad_x[gy, gx]
         vy = -grad_y[gy, gx]
+        
+        # Micro-perturbation to break mathematical saddle-point deadlocks ---
+        vx += np.random.uniform(-1e-3, 1e-3)
+        vy += np.random.uniform(-1e-3, 1e-3)
         
         norm = np.hypot(vx, vy) + 1e-6
         return vx / norm, vy / norm

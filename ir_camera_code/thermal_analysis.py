@@ -33,74 +33,153 @@ def subtract_background(current_frame, background_frame):
     clean_frame = current_frame - background_frame
     return np.clip(clean_frame, a_min=0, a_max=None)
 
-def get_hot_spot_centroid(temp_array, threshold=23.0):
+def create_roi_mask(frame_shape, transform_matrix, roi_mm_polygon):
     """
-    Calculates the sub-pixel centroid of the hottest region above a given threshold.
-    If threshold is less than 1.0 (e.g., 0.75), it is treated as a relative fraction of the maximum value.
-    Otherwise, it is treated as an absolute temperature threshold.
-    Returns the max temperature and the (X, Y) sub-pixel coordinates.
+    Generates a 2D binary uint8 mask (255 inside ROI, 0 outside) by projecting
+    real-world millimeter coordinates back into camera pixel space via inverse homography.
+    
+    Inputs:
+        frame_shape: Tuple (height, width) of the FLIR thermal image array.
+        transform_matrix: 3x3 perspective transformation matrix.
+        roi_mm_polygon: List or array of [X, Y] millimeter coordinates defining the ROI.
+                        e.g. [[10.0, 10.0], [240.0, 10.0], [240.0, 240.0], [10.0, 240.0]]
+    """
+    if transform_matrix is None or roi_mm_polygon is None:
+        return None
+
+    # Calculate inverse matrix (mm -> pixels)
+    inv_matrix = np.linalg.inv(transform_matrix)
+    
+    # Format points for OpenCV perspectiveTransform
+    pts_mm = np.array(roi_mm_polygon, dtype=np.float32).reshape(-1, 1, 2)
+    pts_px = cv2.perspectiveTransform(pts_mm, inv_matrix)
+    pts_px_int = np.int32(pts_px.reshape(-1, 2))
+
+    # Create binary mask
+    mask = np.zeros(frame_shape, dtype=np.uint8)
+    cv2.fillPoly(mask, [pts_px_int], 255)
+    
+    return mask
+
+def get_hot_spot_centroid(temp_array, threshold=0.75, max_temp_cutoff=None, roi_mask=None):
+    """
+    Calculates the sub-pixel centroid of the hottest surface region above threshold,
+    while filtering out the superheated inductive element (pixels >= max_temp_cutoff).
+
+    Parameters:
+        temp_array: 2D floating point temperature array in °C.
+        threshold: Relative fraction (e.g. 0.75) or absolute temperature threshold.
+        max_temp_cutoff: Temperature ceiling (°C). Pixels at or above this value 
+                         (e.g., the coil body) are zeroed out.
+        roi_mask: Binary 2D mask restricting the active bed workspace.
     """
     temp_array_float = temp_array.astype(np.float32)
+
+    # 1. Restrict to Bed Operating Area (if ROI mask provided)
+    if roi_mask is not None:
+        temp_array_float = np.where(roi_mask == 255, temp_array_float, 0.0)
+
+    # 2. Filter out Inductive Element Heat (Temperature Ceiling)
+    if max_temp_cutoff is not None:
+        # Zero out superheated coil pixels so they don't distort centroid or max search
+        temp_array_float = np.where(temp_array_float < max_temp_cutoff, temp_array_float, 0.0)
+
     max_val = np.max(temp_array_float)
-    
+    if max_val < 3.0:  # Noise floor
+        return None, None, None
+
     if threshold < 1.0:
         actual_threshold = max_val * threshold
-        if max_val < 3.0: 
-            return None, None, None
     else:
         actual_threshold = threshold
-    
+
+    # 3. Create Binary Mask for Surface Hotspot
     _, mask = cv2.threshold(temp_array_float, actual_threshold, 255, cv2.THRESH_BINARY)
     mask = mask.astype(np.uint8)
-    
+
+    # Ensure coil pixels remain suppressed in the binary mask
+    if max_temp_cutoff is not None:
+        coil_pixels = (temp_array >= max_temp_cutoff)
+        mask[coil_pixels] = 0
+
+    # 4. Calculate Center of Mass (Centroid) of Surface Hotspot
     M = cv2.moments(mask)
-    
     if M["m00"] != 0:
         c_x = M["m10"] / M["m00"]
         c_y = M["m01"] / M["m00"]
-        
-        max_temp = np.max(temp_array[mask == 255])
-        return max_temp, c_x, c_y
-        
+        max_surface_temp = np.max(temp_array_float[mask == 255])
+        return max_surface_temp, c_x, c_y
+
     return None, None, None
 
-def get_cold_spot_centroid(temp_array, threshold=22.0):
+def create_combined_element_mask(frame_shape, transform_matrix, gantry_x_mm, gantry_y_mm, coil_radius_mm=20.0):
     """
-    Calculates the sub-pixel centroid of the coldest region below a given threshold.
-    If threshold is less than 1.0 (e.g., 0.20), it is treated as a relative fraction 
-    of the temperature range (e.g., isolating the bottom 20% of the heat spread).
-    Otherwise, it is treated as an absolute temperature threshold.
-    Returns the min temperature and the (X, Y) sub-pixel coordinates.
+    Creates a binary mask that blocks out the physical footprint of the coil 
+    based on live gantry position (mm -> pixels via inverse homography).
+    """
+    if transform_matrix is None:
+        return None
+
+    inv_matrix = np.linalg.inv(transform_matrix)
+    pt_mm = np.array([[[gantry_x_mm, gantry_y_mm]]], dtype=np.float32)
+    pt_px = cv2.perspectiveTransform(pt_mm, inv_matrix)
+    u_coil, v_coil = int(pt_px), int(pt_px[1])
+
+    # Convert mm coil radius to approximate pixel radius
+    pt_edge_mm = np.array([[[gantry_x_mm + coil_radius_mm, gantry_y_mm]]], dtype=np.float32)
+    pt_edge_px = cv2.perspectiveTransform(pt_edge_mm, inv_matrix)
+    r_px = int(np.hypot(pt_edge_px - u_coil, pt_edge_px[1] - v_coil))
+
+    mask = np.ones(frame_shape, dtype=np.uint8) * 255
+    cv2.circle(mask, (u_coil, v_coil), r_px, 0, -1)  # Zero out coil area
+    return mask
+
+def get_cold_spot_centroid(temp_array, threshold=0.15, roi_mask=None):
+    """
+    Calculates the sub-pixel centroid of the coldest localized region
+    and returns the local temperature at that centroid.
     """
     temp_array_float = temp_array.astype(np.float32)
-    min_val = np.min(temp_array_float)
-    max_val = np.max(temp_array_float)
-    
-    # If using relative thresholding
+
+    # Ignore pixels outside the active ROI
+    if roi_mask is not None:
+        search_array = np.where(roi_mask == 255, temp_array_float, 999.0)
+    else:
+        search_array = temp_array_float
+
+    min_val = np.min(search_array)
+    # Exclude the 999.0 fill values when determining the valid maximum
+    valid_pixels = search_array[search_array < 900.0]
+    if len(valid_pixels) == 0:
+        return None, None, None
+    max_val = np.max(valid_pixels)
+
+    # Relative thresholding: isolate the bottom X% range of temperatures
     if threshold < 1.0:
-        # Calculate the threshold to capture the bottom X% of the temperature range
         actual_threshold = min_val + ((max_val - min_val) * threshold)
     else:
         actual_threshold = threshold
-    
-    # Create a binary mask of pixels BELOW the temperature threshold
-    # cv2.THRESH_BINARY_INV makes pixels colder than the threshold white (255) 
-    _, mask = cv2.threshold(temp_array_float, actual_threshold, 255, cv2.THRESH_BINARY_INV)
+
+    # Create mask for pixels colder than the threshold
+    _, mask = cv2.threshold(search_array, actual_threshold, 255, cv2.THRESH_BINARY_INV)
+    if roi_mask is not None:
+        mask = np.where(roi_mask == 255, mask, np.uint8(0))
     mask = mask.astype(np.uint8)
-    
-    # Calculate image moments to find the center of mass of the cold signature
+
     M = cv2.moments(mask)
-    
-    # Ensure the area (m00) is not zero to prevent division by zero errors
     if M["m00"] != 0:
-        # Calculate precise sub-pixel coordinates
         c_x = M["m10"] / M["m00"]
         c_y = M["m01"] / M["m00"]
         
-        # Get the actual minimum temperature within the isolated region
-        min_temp = np.min(temp_array[mask == 255])
-        return min_temp, c_x, c_y
+        # Sample the local temperature around the centroid (5x5 pixel patch)
+        ix, iy = int(round(c_x)), int(round(c_y))
+        h, w = temp_array_float.shape
+        y1, y2 = max(0, iy - 2), min(h, iy + 3)
+        x1, x2 = max(0, ix - 2), min(w, ix + 3)
+        centroid_temp = float(np.mean(temp_array_float[y1:y2, x1:x2]))
         
+        return centroid_temp, c_x, c_y
+
     return None, None, None
 
 def remove_hot_spot(temp_array, h_px_x, h_px_y, radius=10):
@@ -184,68 +263,61 @@ def load_transform_matrix(filename="transform_matrix.json"):
         matrix = np.array(json.load(f), dtype=np.float32)
     return matrix
 
-def calibrate_with_checkerboard(image_array, board_dims=(7, 7), square_size_mm=30.0, filename="transform_matrix.json"):
+def calibrate_with_checkerboard(image_array, board_dims=(10, 8), square_size_mm=30.0, filename="transform_matrix.json"):
     """
     Finds a thermal checkerboard in the image and computes a highly accurate homography matrix.
-    
-    Inputs:
-        image_array: The 2D temperature array (or radiometric counts) from the camera.
-        board_dims: The number of INTERIOR corners on the checkerboard (columns, rows).
-        square_size_mm: The physical size of one side of a printed square in millimeters.
     """
-    # Calculate the 2nd and 98th percentiles to ignore extreme hot/cold noise spikes
+    # --- TUNE THESE TO ALIGN THE GREEN HUD BOX ---
+    # The matrix currently anchors (0,0) to the first checkerboard corner.
+    # Increase X to slide the green box LEFT across the image.
+    # Increase Y to slide the green box UP across the image.
+    OFFSET_X_MM = 0.0  
+    OFFSET_Y_MM = 0.0  
+    
+    # If the box is drawn rotated 90-degrees compared to your bed, change to True
+    SWAP_AXES = False
+    # ---------------------------------------------
+    
     vmin, vmax = np.percentile(image_array, (2, 98))
-    
-    # Clip the array to these limits
     clipped_array = np.clip(image_array, a_min=vmin, a_max=vmax)
-    
-    # Normalize the clipped array to 8-bit (0-255)
     img_norm = cv2.normalize(clipped_array, None, 0, 255, cv2.NORM_MINMAX)
     gray_img = np.uint8(img_norm)
     gray_img = cv2.bitwise_not(gray_img)
     
-    # --- DEBUG VIEW ---
-    # This pops up a window showing exactly what OpenCV is trying to process.
-    # If this window looks like a solid gray blob, your thermal delta is still too low.
     cv2.imshow("OpenCV Debug View", gray_img)
-    cv2.waitKey(500) # Pause for half a second to let the window render
-    # ------------------
+    cv2.waitKey(500) 
     
-    # Generate the ideal real-world coordinates for the checkerboard corners
-    # This creates a grid of points like (0,0,0), (30,0,0), (60,0,0)...
     obj_points = np.zeros((board_dims[0] * board_dims[1], 3), np.float32)
-    obj_points[:, :2] = np.mgrid[0:board_dims[0], 0:board_dims[1]].T.reshape(-1, 2)
-    obj_points *= square_size_mm
+    grid = np.mgrid[0:board_dims[0], 0:board_dims[1]].T.reshape(-1, 2)
     
-    # Drop the Z-axis (since the gantry bed is flat) so it matches the 2D pixel coordinates
-    pts_mm = obj_points[:, :2] 
-
-    # Find the checkerboard corners in the thermal image
+    # Apply the offsets and axis orientation
+    if SWAP_AXES:
+        obj_points[:, 0] = (grid[:, 1] * square_size_mm) + OFFSET_X_MM
+        obj_points[:, 1] = (grid[:, 0] * square_size_mm) + OFFSET_Y_MM
+    else:
+        obj_points[:, 0] = (grid[:, 0] * square_size_mm) + OFFSET_X_MM
+        obj_points[:, 1] = (grid[:, 1] * square_size_mm) + OFFSET_Y_MM
+        
+    pts_mm = obj_points[:, :2]
+    
     flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
     found, corners = cv2.findChessboardCorners(gray_img, board_dims, flags)
     
     if found:
         print("Checkerboard detected! Refining sub-pixel coordinates...")
-        
-        # Refine the corner detection to sub-pixel accuracy for maximum precision
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
         corners_subpix = cv2.cornerSubPix(gray_img, corners, (11, 11), (-1, -1), criteria)
         
-        # Reshape the corners array to match the (N, 2) shape of pts_mm
         pts_pixel = corners_subpix.reshape(-1, 2)
-        
-        # Calculate the Homography matrix utilizing all points
-        # RANSAC ignores any falsely detected corner outliers
         matrix, status = cv2.findHomography(pts_pixel, pts_mm, cv2.RANSAC, 5.0)
         
-        # Save the matrix using your existing JSON logic
         if os.path.exists(filename):
             os.remove(filename)
         with open(filename, "w") as f:
             json.dump(matrix.tolist(), f)
             
         print("Checkerboard calibration complete. Matrix saved.")
-        return True
+        return matrix
     else:
         print("Failed to detect checkerboard. Ensure the thermal contrast is high enough.")
         return None

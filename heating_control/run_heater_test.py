@@ -6,6 +6,7 @@ import threading
 import keyboard
 import numpy as np
 import tabu_controller as tc
+import cv2
 
 # Force Matplotlib interactive backend
 import matplotlib
@@ -22,9 +23,9 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 import ir_camera_code.thermal_analysis as ta
 
-# ==========================================
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # GLOBAL THREAD-SAFE STATE MANAGEMENT
-# ==========================================
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 state_lock = threading.Lock()
 CONTINUE_RECORDING = True
 
@@ -35,8 +36,14 @@ GLOBAL_THERMAL_STATE = {
     'hot_centroid': None,   # (mm_x, mm_y)
     'cold_centroids': [],  # List of (mm_x, mm_y) for multiple cold points
     'hot_centroids': [],   # List of (mm_x, mm_y) for multiple hot points
-    'hotspot_intensity': 0.0 
+    'hotspot_intensity': 0.0,
+    'raw_temp_frame': None 
 }
+
+# Define target curing temp and safety ceiling threshold
+TARGET_SURFACE_TEMP = 50.0  # Target surface temperature in °C
+# Coil is >= 50°C hotter than surface, so set cutoff 20°C above surface target
+COIL_TEMP_CEILING = TARGET_SURFACE_TEMP + 20.0  
 
 def get_thermal_state():
     with state_lock:
@@ -46,13 +53,13 @@ def update_thermal_state(new_data):
     with state_lock:
         GLOBAL_THERMAL_STATE.update(new_data)
 
-# ==========================================
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # GANTRY MOTION CONTROL
-# ==========================================
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 CONTROL_HZ = 20                 
 LOOP_DELAY = 1.0 / CONTROL_HZ
 BASE_SPEED = 15.0               
-MIN_SPEED = 2.0                 
+MIN_SPEED = 10.0                 
 MAX_SPEED = 40.0                
 MAX_X, MAX_Y = 250.0, 250.0
 K_p = 0.5   
@@ -93,6 +100,8 @@ def execute_constant_velocity_spiral(axis_x, axis_y, max_radius=120.0, pitch=15.
     axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
     axis_y.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
 
+tabuFlowController = tc.ThermalTabuFlowController(grid_size=(250, 250), tabu_duration=8.0)
+
 def reactive_thermal_loop(axis_x, axis_y):
     """Closed-loop phase. Steers via potential fields and modulates speed based on thermal error."""
     print("[MOTION] Entering Reactive Heating Phase...")
@@ -104,9 +113,25 @@ def reactive_thermal_loop(axis_x, axis_y):
     
     while CONTINUE_RECORDING:
         state = get_thermal_state()
+        raw_temp_array = state['raw_temp_frame']
+        if raw_temp_array is None:
+            time.sleep(LOOP_DELAY)
+            continue
+
+        # Update Tabu Memory with current gantry position
+        tabuFlowController.update_tabu_memory(curr_x, curr_y, radius=15.0, dt=LOOP_DELAY)
+        # Compute flow vector based on current thermal state
         
+        heading_x, heading_y = tabuFlowController.compute_flow_vector(raw_temp_array, curr_x, curr_y, target_temp=state['target_temp'])
+        # If the entire board has reached target temp, hold position
+        if np.min(raw_temp_array) >= (state['target_temp'] - 5.0):
+            axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
+            axis_y.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
+            time.sleep(LOOP_DELAY)
+            continue
         # If no valid thermal signatures are detected, hold position
-        if state['cold_centroid'] is None and state['hot_centroid'] is None:
+        # We rely on the thermal deficit check here instead of the centroids
+        if np.max(raw_temp_array) < 30.0 and np.min(raw_temp_array) > (state['target_temp'] - 5.0):
             axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
             axis_y.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
             time.sleep(LOOP_DELAY)
@@ -120,29 +145,6 @@ def reactive_thermal_loop(axis_x, axis_y):
         modulated_speed = BASE_SPEED - (K_p * error) + (K_d * error_derivative)
         current_speed = max(MIN_SPEED, min(MAX_SPEED, modulated_speed))
         
-        # --- Potential Field Vectors ---
-        dir_x, dir_y = 0.0, 0.0
-        
-        # Attraction to cold
-        if state['cold_centroid'] is not None:
-            v_cold_x = state['cold_centroid'][0] - curr_x
-            v_cold_y = state['cold_centroid'][1] - curr_y
-            dist_cold = math.hypot(v_cold_x, v_cold_y) + 1e-5
-            dir_x += (v_cold_x / dist_cold) * 1.0
-            dir_y += (v_cold_y / dist_cold) * 1.0
-            
-        # Repulsion from hot
-        if state['hot_centroid'] is not None:
-            v_hot_x = curr_x - state['hot_centroid'][0]
-            v_hot_y = curr_y - state['hot_centroid'][1]
-            dist_hot = math.hypot(v_hot_x, v_hot_y) + 1e-5
-            w_hot = state['hotspot_intensity'] * 2.5 
-            dir_x += (v_hot_x / dist_hot) * w_hot
-            dir_y += (v_hot_y / dist_hot) * w_hot
-            
-        mag = math.hypot(dir_x, dir_y) + 1e-5
-        heading_x, heading_y = dir_x / mag, dir_y / mag
-        
         # --- Boundary Safety Limits ---
         if curr_x <= 5.0 and heading_x < 0: heading_x = 0
         if curr_x >= (MAX_X - 5.0) and heading_x > 0: heading_x = 0
@@ -152,12 +154,14 @@ def reactive_thermal_loop(axis_x, axis_y):
         # --- Stream Kinematics ---
         command_vx = heading_x * current_speed
         command_vy = heading_y * current_speed
+        print(f"[MOTION] Flow Vector: ({heading_x:.2f}, {heading_y:.2f}) | Speed: {current_speed:.2f} mm/s")
         
         axis_x.move_velocity(command_vx, Units.VELOCITY_MILLIMETRES_PER_SECOND)
         axis_y.move_velocity(command_vy, Units.VELOCITY_MILLIMETRES_PER_SECOND)
         
         curr_x += command_vx * LOOP_DELAY
         curr_y += command_vy * LOOP_DELAY
+        time.sleep(LOOP_DELAY)
         time.sleep(LOOP_DELAY)
 
 def reactive_thermal_loop_multipoint(axis_x, axis_y):
@@ -172,6 +176,9 @@ def reactive_thermal_loop_multipoint(axis_x, axis_y):
     while CONTINUE_RECORDING:
         state = get_thermal_state()
         
+        tabuFlowController.update_tabu_memory(curr_x, curr_y, radius=15.0, dt=LOOP_DELAY)
+        tabuFlowController.update_thermal_state(state)
+
         # If no valid thermal signatures are detected, hold position
         if state['cold_centroids'] is None and state['hot_centroids'] is None:
             axis_x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
@@ -221,7 +228,7 @@ def reactive_thermal_loop_multipoint(axis_x, axis_y):
         # --- Stream Kinematics ---
         command_vx = heading_x * current_speed
         command_vy = heading_y * current_speed
-        
+        print(f"[MOTION] Commanded Velocities: Vx={command_vx:.2f} mm/s, Vy={command_vy:.2f} mm/s")
         axis_x.move_velocity(command_vx, Units.VELOCITY_MILLIMETRES_PER_SECOND)
         axis_y.move_velocity(command_vy, Units.VELOCITY_MILLIMETRES_PER_SECOND)
         
@@ -231,15 +238,15 @@ def reactive_thermal_loop_multipoint(axis_x, axis_y):
 
 def gantry_worker(x, y):
     try:
-        execute_constant_velocity_spiral(x, y)
+        #execute_constant_velocity_spiral(x, y)
         reactive_thermal_loop(x, y)
         #reactive_thermal_loop_multipoint(x, y)
     except Exception as e:
         print(f"[MOTION ERROR] {e}")
 
-# ==========================================
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # CAMERA ACQUISITION & PROCESSING
-# ==========================================
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def handle_close(evt):
     global CONTINUE_RECORDING
@@ -295,13 +302,6 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
         r3 = ((1 - ExtOpticsTransmission) / (Emiss * Tau * ExtOpticsTransmission)) * (R / (np.exp(B / TAtm) - F))
         K2 = r1 + r2 + r3
 
-        # Load Computer Vision Files
-        if os.path.exists("background.npy"):
-            background_Temp = ta.load_background(filename="background.npy")
-        else:
-            print("No background frame found. Please run the calibration script first.")
-            return False
-            
         if os.path.exists("transform_matrix.json"):
             transform_matrix = ta.load_transform_matrix("transform_matrix.json")
         else:
@@ -321,6 +321,29 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
 
         print('Press Enter to stop streaming')
 
+        # Define active operating area in real-world mm (e.g. 20mm to 230mm within 250mm bed)
+        OPERATING_SURFACE_MM = [
+            [20.0, 20.0],
+            [230.0, 20.0],
+            [230.0, 230.0],
+            [20.0, 230.0]
+        ]
+
+        # Inside acquire_and_display_images right after loading transform_matrix:
+        transform_matrix = ta.load_transform_matrix("transform_matrix.json")
+
+        # Pre-calculate ROI pixel mask & boundary overlay line
+        roi_mask = None
+
+        if transform_matrix is not None:
+            # Build binary ROI mask for 2D thermal searches
+            roi_mask = ta.create_roi_mask((480, 640), transform_matrix, OPERATING_SURFACE_MM)
+            
+            # Project MM polygon back to pixels for live HUD display
+            inv_matrix = np.linalg.inv(transform_matrix)
+            closed_polygon_mm = np.array(OPERATING_SURFACE_MM + [OPERATING_SURFACE_MM[0]], dtype=np.float32).reshape(-1, 1, 2)
+            roi_pixels = cv2.perspectiveTransform(closed_polygon_mm, inv_matrix).reshape(-1, 2)
+
         while CONTINUE_RECORDING:
             try:
                 image_result = cam.GetNextImage(1000)
@@ -333,12 +356,18 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
                     image_Radiance = (image_data - J0) / J1
                     image_Temp = (B / np.log(R / ((image_Radiance / Emiss / Tau) - K2) + F)) - 273.15
                     
-                    clean_temp_array = ta.subtract_background(image_Temp, background_Temp)
-                    #"""
                     # Find Centroids
-                    hot_max, h_px_x, h_px_y = ta.get_hot_spot_centroid(clean_temp_array, threshold=0.75)
-                    cold_min, c_px_x, c_px_y = ta.get_cold_spot_centroid(clean_temp_array, threshold=0.15)
-
+                    hot_max, h_px_x, h_px_y = ta.get_hot_spot_centroid(image_Temp, threshold=50.0, max_temp_cutoff=COIL_TEMP_CEILING, roi_mask=roi_mask)
+                    cold_min, c_px_x, c_px_y = ta.get_cold_spot_centroid(image_Temp, threshold=0.15, roi_mask=roi_mask)
+                    # Warp the 480x640 camera pixels into a 250x250 physical mm grid
+                    physical_bed_map = cv2.warpPerspective(image_Temp, transform_matrix, (250, 250))
+                    if hot_max is not None:
+                        if hot_max > TARGET_SURFACE_TEMP:
+                            intensity = max(0.0, min(1.0, (hot_max - TARGET_SURFACE_TEMP) / 20.0))
+                        else:
+                            intensity = 0.0
+                    else:
+                        intensity = 0.0
                     update_data = {
                         'target_temp': 180.0,
                         'current_min_temp': cold_min if cold_min is not None else 25.0,
@@ -346,7 +375,8 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
                         'hot_centroid': None,
                         'cold_centroids': [],
                         'hot_centroids': [],
-                        'hotspot_intensity': 0.0
+                        'hotspot_intensity': intensity,
+                        'raw_temp_frame': physical_bed_map
                     }
 
                     # Update Visuals and State
@@ -372,6 +402,9 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
                     else:
                         cold_plot.set_data([], [])
                         cold_text.set_text("")
+
+                    if roi_pixels is not None:
+                        ax.plot(roi_pixels[:, 0], roi_pixels[:, 1], color='lime', linestyle='--', linewidth=1.5, label='Active Search ROI')
 
                     """
                     hotSpots, coldSpots = True, True
@@ -401,7 +434,7 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
                             hot_plot.set_data([h_px_x], [h_px_y])
                             hot_text.set_position((h_px_x + 5, h_px_y))
                             hot_text.set_text(f"{hot_max:.2f}°C")
-                            remove_hot_spot(clean_temp_array, h_px_x, h_px_y, radius=10)
+                            remove_hot_spot(image_Temp, h_px_x, h_px_y, radius=10)
                         else:
                             hot_plot.set_data([], [])
                             hot_text.set_text("")
