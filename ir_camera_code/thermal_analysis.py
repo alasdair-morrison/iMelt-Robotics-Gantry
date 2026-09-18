@@ -134,10 +134,10 @@ def create_combined_element_mask(frame_shape, transform_matrix, gantry_x_mm, gan
     cv2.circle(mask, (u_coil, v_coil), r_px, 0, -1)  # Zero out coil area
     return mask
 
-def get_cold_spot_centroid(temp_array, threshold=0.15, roi_mask=None):
+def get_cold_spot_centroid(temp_array, threshold=0.05, roi_mask=None):
     """
-    Calculates the sub-pixel centroid of the coldest localized region
-    and returns the local temperature at that centroid.
+    Calculates the sub-pixel centroid of the coldest localized region.
+    Uses percentile thresholding to ignore extreme hot outliers.
     """
     temp_array_float = temp_array.astype(np.float32)
 
@@ -147,24 +147,21 @@ def get_cold_spot_centroid(temp_array, threshold=0.15, roi_mask=None):
     else:
         search_array = temp_array_float
 
-    min_val = np.min(search_array)
-    # Exclude the 999.0 fill values when determining the valid maximum
+    # Flatten and remove excluded pixels to get the valid temperature distribution
     valid_pixels = search_array[search_array < 900.0]
     if len(valid_pixels) == 0:
         return None, None, None
-    max_val = np.max(valid_pixels)
 
-    # Relative thresholding: isolate the bottom X% range of temperatures
+    # Robust Percentile Thresholding
     if threshold < 1.0:
-        actual_threshold = min_val + ((max_val - min_val) * threshold)
+        # Isolate the absolute coldest X% of the board's physical pixels (e.g., 0.05 = 5th percentile)
+        actual_threshold = np.percentile(valid_pixels, threshold * 100)
     else:
         actual_threshold = threshold
 
-    # Create mask for pixels colder than the threshold
-    _, mask = cv2.threshold(search_array, actual_threshold, 255, cv2.THRESH_BINARY_INV)
-    if roi_mask is not None:
-        mask = np.where(roi_mask == 255, mask, np.uint8(0))
-    mask = mask.astype(np.uint8)
+    # Create mask for pixels colder than the calculated percentile
+    mask = np.zeros_like(temp_array_float, dtype=np.uint8)
+    mask[(search_array <= actual_threshold)] = 255
 
     M = cv2.moments(mask)
     if M["m00"] != 0:

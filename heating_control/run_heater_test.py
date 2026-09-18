@@ -246,6 +246,8 @@ def gantry_worker(x, y):
         #execute_constant_velocity_spiral(x, y)
         reactive_thermal_loop(x, y)
         #reactive_thermal_loop_multipoint(x, y)
+        x.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
+        y.move_velocity(0, Units.VELOCITY_MILLIMETRES_PER_SECOND)
     except Exception as e:
         print(f"[MOTION ERROR] {e}")
 
@@ -375,8 +377,7 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
                     clean_temp_array = np.where(full_heater_mask == 1, neutral_temp, image_Temp)
                     # Find Centroids
                     hot_max, h_px_x, h_px_y = ta.get_hot_spot_centroid(clean_temp_array, threshold=50.0, max_temp_cutoff=COIL_TEMP_CEILING, roi_mask=roi_mask)
-                    cold_min, c_px_x, c_px_y = ta.get_cold_spot_centroid(clean_temp_array, threshold=0.15, roi_mask=roi_mask)
-                    # Warp the 480x640 camera pixels into a 250x250 physical mm grid
+                    cold_min, c_px_x, c_px_y = ta.get_cold_spot_centroid(clean_temp_array, threshold=0.05, roi_mask=roi_mask)
                     physical_bed_map = cv2.warpPerspective(image_Temp, transform_matrix, (250, 250))
                     if hot_max is not None:
                         if hot_max > TARGET_SURFACE_TEMP:
@@ -555,12 +556,12 @@ def main():
             y.wait_until_idle()
             
             # Start the background gantry thread
-            gantry_thread = threading.Thread(target=gantry_worker, args=(x, y), daemon=True)
+            gantry_thread = threading.Thread(target=gantry_worker, args=(y, x), daemon=True)
             gantry_thread.start()
             
             # Start the blocking camera loop on the main thread
             result &= run_single_camera(cam)
-            
+            gantry_thread.join()  # Wait for the gantry thread to finish before exiting
         print("Gantry thread has been stopped. Control Program is exiting...")
         
     except Exception as e:
