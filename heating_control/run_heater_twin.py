@@ -7,6 +7,7 @@ import tabu_controller as tc
 import cv2
 import asyncio
 import PySpin
+import math
 from zaber_motion import Units
 from zaber_motion.ascii import Connection
 
@@ -19,25 +20,27 @@ import ir_camera_code.thermal_analysis as ta
 # GLOBAL CONFIGURATION
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 BED_SIZE_MM = 250.0
+WORKING_RADIUS_MM = 75.0   # mm
 TARGET_TEMP = 50.0
 MIN_SPEED = 10.0   # mm/s - Speed when over a cold spot (depositing heat)
 MAX_SPEED = 40.0   # mm/s - Speed when over a hot spot (sprinting)
 RASTER_STEP = 20.0 # mm - Distance between sweep passes
+SPIRAL_STEP = 5.0  # mm - Distance between spiral loops
 TOOL_RADIUS = 25.0 # mm - Radius to mask out the physical induction wand
 
 class ThermalTwin:
-    def __init__(self, size_mm=BED_SIZE_MM, resolution_mm=1.0):
-        """
-        Creates a persistent 2D virtual matrix of the bed.
-        1 pixel = 1 mm by default.
-        """
+    def __init__(self, size_mm=BED_SIZE_MM, resolution_mm=1.0, radius_mm=WORKING_RADIUS_MM):
         self.size = int(size_mm / resolution_mm)
-        # Initialize the board at a standard ambient 25°C
+        self.center = self.size // 2
+        self.radius = int(radius_mm / resolution_mm)
         self.grid = np.full((self.size, self.size), 25.0, dtype=np.float32)
         self.lock = threading.Lock()
+        
+        # Pre-compute a static circular boundary mask
+        self.boundary_mask = np.zeros((self.size, self.size), dtype=np.uint8)
+        cv2.circle(self.boundary_mask, (self.center, self.center), self.radius, 1, thickness=-1)
 
     def update_from_camera(self, raw_thermal_frame, homography_matrix, g_x, g_y):
-        # Warp the camera frame to the 250x250 grid, filling empty space with ambient 25C
         top_down_map = cv2.warpPerspective(
             raw_thermal_frame, 
             homography_matrix, 
@@ -45,22 +48,17 @@ class ThermalTwin:
             borderValue=25.0
         )
 
-        # Identify the exact physical boundary of the camera's vision
         cam_mask = np.ones(raw_thermal_frame.shape[:2], dtype=np.uint8)
         valid_cam_area = cv2.warpPerspective(cam_mask, homography_matrix, (self.size, self.size), borderValue=0)
 
-        # Create a kinematic mask for the gantry's current position
         valid_mask = np.ones((self.size, self.size), dtype=np.uint8)
         if 0 <= g_x < self.size and 0 <= g_y < self.size:
-            # Mask out the physical induction wand
             cv2.circle(valid_mask, (int(g_x), int(g_y)), int(TOOL_RADIUS), 0, thickness=-1)
 
-        # Safely update the virtual grid
         with self.lock:
-            # Update pixels ONLY where the camera has vision AND the toolhead is not blocking
-            valid_pixels = (valid_mask == 1) & (valid_cam_area == 1)
+            # ONLY update pixels that are unoccluded AND inside the circular working boundary
+            valid_pixels = (valid_mask == 1) & (valid_cam_area == 1) & (self.boundary_mask == 1)
             self.grid[valid_pixels] = (0.8 * top_down_map[valid_pixels]) + (0.2 * self.grid[valid_pixels])
-
     def get_local_temperature(self, x, y):
         """ Returns the temperature at a specific physical coordinate. """
         ix, iy = int(np.clip(x, 0, self.size-1)), int(np.clip(y, 0, self.size-1))
@@ -72,18 +70,69 @@ thermal_twin = ThermalTwin()
 current_gantry_pos = [0.0, 0.0]  # [x, y]
 system_running = True
 
-def generate_raster_path(size_mm=BED_SIZE_MM, step_mm=RASTER_STEP):
-    """ Generates a deterministic zig-zag pattern covering the whole board. """
+def generate_circular_raster_path(size_mm=BED_SIZE_MM, step_mm=RASTER_STEP, radius_mm=WORKING_RADIUS_MM):
+    """ Generates a deterministic zig-zag pattern constrained to a circular boundary. """
     waypoints = []
-    for y in np.arange(0, size_mm + step_mm, step_mm):
-        y_val = min(y, size_mm)
-        # Alternate left-to-right and right-to-left
-        if int(y // step_mm) % 2 == 0:
-            waypoints.append([0.0, y_val])
-            waypoints.append([size_mm, y_val])
+    
+    # Calculate the exact center of the mapped area
+    cx = size_mm / 2.0
+    cy = size_mm / 2.0
+    
+    # The sweep only needs to run from the top of the circle to the bottom
+    y_start = cy - radius_mm
+    y_end = cy + radius_mm
+    
+    for y in np.arange(y_start, y_end + step_mm, step_mm):
+        y_val = min(y, y_end)
+        
+        # Distance from the center Y
+        dy = y_val - cy 
+        
+        # Prevent math domain errors at the exact poles
+        if radius_mm**2 < dy**2:
+            continue 
+            
+        # Calculate the X boundary at this specific Y height using Pythagorean theorem
+        dx = math.sqrt(radius_mm**2 - dy**2)
+        
+        x_left = cx - dx
+        x_right = cx + dx
+        
+        # Alternate left-to-right and right-to-left sweeping
+        iteration = int(round((y_val - y_start) / step_mm))
+        if iteration % 2 == 0:
+            waypoints.append([x_left, y_val])
+            waypoints.append([x_right, y_val])
         else:
-            waypoints.append([size_mm, y_val])
-            waypoints.append([0.0, y_val])
+            waypoints.append([x_right, y_val])
+            waypoints.append([x_left, y_val])
+            
+    return waypoints
+
+def generate_spiral_path(size_mm=BED_SIZE_MM, step_mm=SPIRAL_STEP, radius_mm=WORKING_RADIUS_MM):
+    """ Generates a spiral path constrained to a circular boundary. """
+    waypoints = []
+    
+    # Calculate the exact center of the mapped area
+    cx = size_mm / 2.0
+    cy = size_mm / 2.0
+    
+    # Start from the outer edge and spiral inward
+    r = radius_mm
+    angle = 0.0
+    
+    while r > 0:
+        x = cx + r * math.cos(angle)
+        y = cy + r * math.sin(angle)
+        
+        # Only add points that are within the circular boundary
+        if (x - cx)**2 + (y - cy)**2 <= radius_mm**2:
+            waypoints.append([x, y])
+        
+        # Increment angle and decrease radius for the spiral effect
+        angle += step_mm / r  # Adjust angle increment based on current radius
+        r -= step_mm / (2 * math.pi)  # Decrease radius gradually
+        
     return waypoints
 
 def camera_thread_function():
@@ -207,9 +256,12 @@ def camera_thread_function():
                                     norm_grid = np.clip((grid_copy - 20.0) * (255.0 / (120.0 - 20.0)), 0, 255).astype(np.uint8)
                                     twin_display = cv2.applyColorMap(norm_grid, cv2.COLORMAP_INFERNO)
                                     
-                                    # Draw a green circle showing the software where the gantry is
-                                    cv2.circle(twin_display, (int(gx), int(gy)), int(TOOL_RADIUS), (0, 255, 0), 1)
+                                    # Draw a green circle showing the physical operation boundary
+                                    cx, cy = int(BED_SIZE_MM / 2), int(BED_SIZE_MM / 2)
+                                    cv2.circle(twin_display, (cx, cy), int(WORKING_RADIUS_MM), (0, 255, 0), 2)
                                     
+                                    # Draw a blue dot showing where the software thinks the gantry is
+                                    cv2.circle(twin_display, (int(gx), int(gy)), 3, (255, 0, 0), -1)
                                     cv2.imshow("Thermal Twin", twin_display)
                                     cv2.waitKey(1)
                                     
@@ -230,10 +282,6 @@ def camera_thread_function():
     del cam
     cam_list.Clear()
     system.ReleaseInstance()
-    # ... [After updating the digital twin] ...
-                                    
-    
-
     return result
 
 async def execute_modulated_sweep(axis_x, axis_y):
@@ -243,7 +291,8 @@ async def execute_modulated_sweep(axis_x, axis_y):
     """
     global current_gantry_pos, system_running
     
-    waypoints = generate_raster_path()
+    waypoints = generate_circular_raster_path()
+    # waypoints = generate_spiral_path()
     print(f"Generated {len(waypoints)} sweep waypoints.")
     
     for target_x, target_y in waypoints:
@@ -283,7 +332,7 @@ async def execute_modulated_sweep(axis_x, axis_y):
             
             await asyncio.sleep(0.05) # 20Hz control loop
 
-    print("Raster sweep complete.")
+    print("Sweep complete.")
     system_running = False
 
 if __name__ == "__main__":
