@@ -388,10 +388,10 @@ def main():
 
     # Run example on each camera
     for i, cam in enumerate(cam_list):
-
+        PORT = '/dev/ttyACM0'
         print('Running example for camera %d...' % i)
         try:
-                with Connection.open_serial_port("COM6") as connection:
+                with Connection.open_serial_port(PORT) as connection:
                     connection.enable_alerts()
                     device_list = connection.detect_devices()
                     device = device_list[0]

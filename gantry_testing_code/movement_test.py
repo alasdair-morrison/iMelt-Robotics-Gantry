@@ -1,8 +1,8 @@
 # Default sample code from Zaber Motion Library for Python
 from zaber_motion import Units
 from zaber_motion.ascii import Connection
-
-with Connection.open_serial_port("COM6") as connection:
+PORT = '/dev/ttyACM0'
+with Connection.open_serial_port(PORT) as connection:
     connection.enable_alerts()
 
     device_list = connection.detect_devices()

@@ -10,7 +10,7 @@ import PySpin
 import math
 from zaber_motion import Units
 from zaber_motion.ascii import Connection
-
+PORT = '/dev/ttyACM0'
 # Ensure thermal_analysis can be imported
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -342,7 +342,7 @@ if __name__ == "__main__":
 
     async def main_motion_routine():
         global system_running
-        with Connection.open_serial_port("COM6") as connection:
+        with Connection.open_serial_port(PORT) as connection:
             connection.enable_alerts()
             device_list = connection.detect_devices()
             device = device_list[0]

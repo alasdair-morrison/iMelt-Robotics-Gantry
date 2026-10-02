@@ -4,9 +4,7 @@ import PySpin
 import matplotlib
 matplotlib.use('Qt5Agg')  # Add this line to force an interactive window
 import matplotlib.pyplot as plt
-import keyboard
 import numpy as np
-
 
 class IRFormatType:
     LINEAR_10MK = 1
@@ -28,6 +26,11 @@ def handle_close(evt):
     global CONTINUE_RECORDING
     CONTINUE_RECORDING = False
 
+def handle_key(evt):
+  global CONTINUE_RECORDING
+  if evt.key in ('enter', 'q', 'escape'):
+    print(f"'{evt.key}' pressed. Program is closing...")
+    CONTINUE_RECORDING = False
 
 def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
     """
@@ -181,9 +184,9 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
         # Figure(1) is default so you can omit this line. Figure(0) will create a new window every time program hits this line
         fig = plt.figure(1)
 
-        # Close the GUI when close event happens
+        # Close the GUI when close event happens or key is pressed
         fig.canvas.mpl_connect('close_event', handle_close)
-
+        fig.canvas.mpl_connect('key_press_event', handle_key)
         if CHOSEN_IR_TYPE == IRFormatType.RADIOMETRIC:
             # Object Parameters. For this demo, they are imposed!
             # This section is important when the streaming is set to radiometric and not TempLinear
@@ -292,14 +295,6 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
 
                     # Clear current reference of a figure. This will improve display speed significantly
                     plt.clf()
-
-                    # If user presses enter, close the program
-                    if keyboard.is_pressed('ENTER'):
-                        print('Program is closing...')
-
-                        # Close figure
-                        plt.close('all')
-                        CONTINUE_RECORDING = False
 
                 #  Release image
                 #
