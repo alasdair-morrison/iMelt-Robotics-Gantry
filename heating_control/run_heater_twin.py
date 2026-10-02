@@ -109,30 +109,75 @@ def generate_circular_raster_path(size_mm=BED_SIZE_MM, step_mm=RASTER_STEP, radi
             
     return waypoints
 
-def generate_spiral_path(size_mm=BED_SIZE_MM, step_mm=SPIRAL_STEP, radius_mm=WORKING_RADIUS_MM):
-    """ Generates a spiral path constrained to a circular boundary. """
+def generate_spiral_path(size_mm=BED_SIZE_MM, step_mm=SPIRAL_STEP, radius_mm=WORKING_RADIUS_MM, puck_radius=TOOL_RADIUS):
+    """ Generates an outward spiral path constrained by a physical boundary. """
     waypoints = []
     
     # Calculate the exact center of the mapped area
     cx = size_mm / 2.0
     cy = size_mm / 2.0
     
-    # Start from the outer edge and spiral inward
-    r = radius_mm
+    # The absolute limit the center of the puck can travel without the edge touching the wall
+    safe_max_radius = radius_mm - puck_radius
+    
+    # Start the path exactly at the current centered gantry position
+    waypoints.append([cx, cy])
+    
+    # Initialize Archimedean spiral parameters
+    # r starts slightly above 0 to prevent ZeroDivisionError during the first angle increment
+    r = step_mm / (2 * math.pi) 
     angle = 0.0
     
-    while r > 0:
+    while r <= safe_max_radius:
         x = cx + r * math.cos(angle)
         y = cy + r * math.sin(angle)
         
-        # Only add points that are within the circular boundary
-        if (x - cx)**2 + (y - cy)**2 <= radius_mm**2:
-            waypoints.append([x, y])
+        waypoints.append([x, y])
         
-        # Increment angle and decrease radius for the spiral effect
-        angle += step_mm / r  # Adjust angle increment based on current radius
-        r -= step_mm / (2 * math.pi)  # Decrease radius gradually
+        # Increment angle based on arc length to maintain consistent surface velocity and heating overlap
+        angle += step_mm / r  
         
+        # Expand the radius gradually for each loop
+        r += step_mm / (2 * math.pi) 
+        
+    return waypoints
+
+def generate_concentric_path(size_mm=BED_SIZE_MM, radius_mm=WORKING_RADIUS_MM, puck_radius=TOOL_RADIUS):
+    """ Generates concentric circular paths constrained by a physical boundary to ensure even heating. """
+    waypoints = []
+    
+    # Calculate the exact center of the mapped area
+    cx = size_mm / 2.0
+    cy = size_mm / 2.0
+    
+    # The absolute limit the center of the puck can travel without the edge touching the physical wall
+    safe_max_radius = radius_mm - puck_radius
+    
+    # Step size defined by the puck radius to guarantee complete coverage with limited overlap
+    step_mm = puck_radius 
+    
+    # Generate discrete radii for concentric circles from the center outwards
+    radii = np.arange(0, safe_max_radius + 0.1, step_mm)
+    
+    # Set a fixed distance between waypoints along the circumference to maintain steady surface velocity
+    arc_resolution = 5.0
+    
+    for r in radii:
+        if r == 0:
+            # Ensure the dead-center point is hit
+            waypoints.append([cx, cy])
+        else:
+            # Calculate required waypoints for the current ring to maintain constant arc resolution
+            circumference = 2 * math.pi * r
+            num_points = int(math.ceil(circumference / arc_resolution))
+            
+            # Generate points for the concentric ring
+            for i in range(num_points):
+                angle = (2 * math.pi * i) / num_points
+                x = cx + r * math.cos(angle)
+                y = cy + r * math.sin(angle)
+                waypoints.append([x, y])
+                
     return waypoints
 
 def camera_thread_function():
@@ -291,8 +336,9 @@ async def execute_modulated_sweep(axis_x, axis_y):
     """
     global current_gantry_pos, system_running
     
-    waypoints = generate_circular_raster_path()
+    # waypoints = generate_circular_raster_path()
     # waypoints = generate_spiral_path()
+    waypoints = generate_concentric_path()
     print(f"Generated {len(waypoints)} sweep waypoints.")
     
     for target_x, target_y in waypoints:
