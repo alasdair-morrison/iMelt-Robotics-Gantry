@@ -1,4 +1,5 @@
 import os
+import queue
 import sys
 import time
 import threading
@@ -10,7 +11,7 @@ import PySpin
 import math
 from zaber_motion import Units
 from zaber_motion.ascii import Connection
-PORT = '/dev/ttyACM0'
+PORT = '/dev/ttyUSB0'
 # Ensure thermal_analysis can be imported
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -22,11 +23,14 @@ import ir_camera_code.thermal_analysis as ta
 BED_SIZE_MM = 250.0
 WORKING_RADIUS_MM = 75.0   # mm
 TARGET_TEMP = 50.0
-MIN_SPEED = 10.0   # mm/s - Speed when over a cold spot (depositing heat)
-MAX_SPEED = 40.0   # mm/s - Speed when over a hot spot (sprinting)
+MIN_SPEED = 100.0   # mm/s - Speed when over a cold spot (depositing heat)
+MAX_SPEED = 100.0   # mm/s - Speed when over a hot spot (sprinting)
 RASTER_STEP = 20.0 # mm - Distance between sweep passes
 SPIRAL_STEP = 5.0  # mm - Distance between spiral loops
-TOOL_RADIUS = 25.0 # mm - Radius to mask out the physical induction wand
+TOOL_RADIUS = 55.0 # mm - Radius to mask out the physical induction wand
+ACTIVE_SHAPE = 'square'      # Set to 'circle' or 'square'
+ACTIVE_PATTERN = 'lawnmower' # Set to 'lawnmower' or 'concentric'
+MARGIN_MM = 5.0              # Safety air-gap from the physical wall
 
 class ThermalTwin:
     def __init__(self, size_mm=BED_SIZE_MM, resolution_mm=1.0, radius_mm=WORKING_RADIUS_MM):
@@ -65,49 +69,58 @@ class ThermalTwin:
         with self.lock:
             return float(self.grid[iy, ix])
 
+class AsynchronousVideoCapture:
+    def __init__(self, filename="iMelt_Trial_", fps=20, frame_size=(640, 480), max_queue_size=30):
+        self.filename = filename + time.strftime("%Y%m%d_%H%M%S") + ".mp4"
+        self.fps = fps
+        self.frame_size = frame_size
+        self.max_queue_size = max_queue_size
+        self.queue = queue.Queue(maxsize=max_queue_size)
+        self.stop_event = threading.Event()
+        # Initialize OpenCV VideoWriter
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.writer = cv2.VideoWriter(self.filename, fourcc, self.fps, self.frame_size)
+        # Start consumer thread
+        self.worker_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self.worker_thread.start()
+    def _writer_loop(self):
+        """Background thread worker that writes frames from the queue to disk."""
+        while not self.stop_event.is_set() or not self.queue.empty():
+            try:
+                # Wait up to 0.5s for a frame
+                frame = self.queue.get(timeout=0.5)
+                # Check for shutdown sentinel
+                if frame is None:
+                    self.queue.task_done()
+                    break
+                self.writer.write(frame)
+                self.queue.task_done()
+            except queue.Empty:
+                continue
+        # Release file resource when loop terminates
+        if self.writer is not None:
+            self.writer.release()
+    def add_frame(self, frame):
+        """Non-blocking method to add a frame to the queue. Drops frame if queue is full to preserve real-time gantry performance."""
+        try:
+            self.queue.put_nowait(frame)
+        except queue.Full:
+            # Queue is full — drop video frame to prevent blocking control loop
+            pass
+    def stop(self):
+        """Gracefully flushes remaining queued frames and closes video file."""
+        self.stop_event.set()
+        try:
+            self.queue.put_nowait(None)  # Enqueue sentinel to wake worker
+        except queue.Full:
+            pass
+        if self.worker_thread.is_alive():
+            self.worker_thread.join()
+
 # Global instances
 thermal_twin = ThermalTwin()
 current_gantry_pos = [0.0, 0.0]  # [x, y]
 system_running = True
-
-def generate_circular_raster_path(size_mm=BED_SIZE_MM, step_mm=RASTER_STEP, radius_mm=WORKING_RADIUS_MM):
-    """ Generates a deterministic zig-zag pattern constrained to a circular boundary. """
-    waypoints = []
-    
-    # Calculate the exact center of the mapped area
-    cx = size_mm / 2.0
-    cy = size_mm / 2.0
-    
-    # The sweep only needs to run from the top of the circle to the bottom
-    y_start = cy - radius_mm
-    y_end = cy + radius_mm
-    
-    for y in np.arange(y_start, y_end + step_mm, step_mm):
-        y_val = min(y, y_end)
-        
-        # Distance from the center Y
-        dy = y_val - cy 
-        
-        # Prevent math domain errors at the exact poles
-        if radius_mm**2 < dy**2:
-            continue 
-            
-        # Calculate the X boundary at this specific Y height using Pythagorean theorem
-        dx = math.sqrt(radius_mm**2 - dy**2)
-        
-        x_left = cx - dx
-        x_right = cx + dx
-        
-        # Alternate left-to-right and right-to-left sweeping
-        iteration = int(round((y_val - y_start) / step_mm))
-        if iteration % 2 == 0:
-            waypoints.append([x_left, y_val])
-            waypoints.append([x_right, y_val])
-        else:
-            waypoints.append([x_right, y_val])
-            waypoints.append([x_left, y_val])
-            
-    return waypoints
 
 def generate_spiral_path(size_mm=BED_SIZE_MM, step_mm=SPIRAL_STEP, radius_mm=WORKING_RADIUS_MM, puck_radius=TOOL_RADIUS):
     """ Generates an outward spiral path constrained by a physical boundary. """
@@ -142,42 +155,97 @@ def generate_spiral_path(size_mm=BED_SIZE_MM, step_mm=SPIRAL_STEP, radius_mm=WOR
         
     return waypoints
 
-def generate_concentric_path(size_mm=BED_SIZE_MM, radius_mm=WORKING_RADIUS_MM, puck_radius=TOOL_RADIUS):
-    """ Generates concentric circular paths constrained by a physical boundary to ensure even heating. """
+import math
+import numpy as np
+
+def generate_concentric_path(size_mm=BED_SIZE_MM, radius_mm=WORKING_RADIUS_MM, puck_radius=TOOL_RADIUS, margin_mm=5.0, shape='circle'):
+    """ Generates concentric paths for either 'circle' or 'square' samples with boundary safety. """
     waypoints = []
-    
-    # Calculate the exact center of the mapped area
     cx = size_mm / 2.0
     cy = size_mm / 2.0
     
-    # The absolute limit the center of the puck can travel without the edge touching the physical wall
-    safe_max_radius = radius_mm - puck_radius
+    # Bounding limit guaranteeing the physical tool never touches the chamber walls
+    safe_max_radius = radius_mm - puck_radius - margin_mm
     
-    # Step size defined by the puck radius to guarantee complete coverage with limited overlap
+    if safe_max_radius < 0:
+        return waypoints 
+        
     step_mm = puck_radius 
-    
-    # Generate discrete radii for concentric circles from the center outwards
     radii = np.arange(0, safe_max_radius + 0.1, step_mm)
-    
-    # Set a fixed distance between waypoints along the circumference to maintain steady surface velocity
     arc_resolution = 5.0
     
     for r in radii:
         if r == 0:
-            # Ensure the dead-center point is hit
             waypoints.append([cx, cy])
         else:
-            # Calculate required waypoints for the current ring to maintain constant arc resolution
-            circumference = 2 * math.pi * r
-            num_points = int(math.ceil(circumference / arc_resolution))
-            
-            # Generate points for the concentric ring
-            for i in range(num_points):
-                angle = (2 * math.pi * i) / num_points
-                x = cx + r * math.cos(angle)
-                y = cy + r * math.sin(angle)
-                waypoints.append([x, y])
+            if shape == 'circle':
+                num_points = int(math.ceil((2 * math.pi * r) / arc_resolution))
+                for i in range(num_points):
+                    angle = (2 * math.pi * i) / num_points
+                    x = cx + r * math.cos(angle)
+                    y = cy + r * math.sin(angle)
+                    waypoints.append([x, y])
+                    
+            elif shape == 'square':
+                # Determine how many points are needed per side to maintain constant surface velocity
+                side_points = int(math.ceil((2 * r) / arc_resolution))
+                if side_points < 1: 
+                    side_points = 1
                 
+                # Top edge (Left to Right)
+                for x in np.linspace(cx - r, cx + r, side_points, endpoint=False):
+                    waypoints.append([x, cy - r])
+                # Right edge (Top to Bottom)
+                for y in np.linspace(cy - r, cy + r, side_points, endpoint=False):
+                    waypoints.append([cx + r, y])
+                # Bottom edge (Right to Left)
+                for x in np.linspace(cx + r, cx - r, side_points, endpoint=False):
+                    waypoints.append([x, cy + r])
+                # Left edge (Bottom to Top)
+                for y in np.linspace(cy + r, cy - r, side_points, endpoint=False):
+                    waypoints.append([cx - r, y])
+                
+    return waypoints
+
+def generate_lawnmower_path(size_mm=BED_SIZE_MM, step_mm=RASTER_STEP, radius_mm=WORKING_RADIUS_MM, puck_radius=TOOL_RADIUS, margin_mm=5.0, shape='circle'):
+    """ Generates a zig-zag raster constrained to either a 'circle' or 'square' boundary. """
+    waypoints = []
+    cx = size_mm / 2.0
+    cy = size_mm / 2.0
+    
+    safe_max_radius = radius_mm - puck_radius - margin_mm
+    
+    if safe_max_radius < 0:
+        return waypoints
+
+    y_start = cy - safe_max_radius
+    y_end = cy + safe_max_radius
+    
+    for y in np.arange(y_start, y_end + step_mm, step_mm):
+        y_val = min(y, y_end)
+        dy = y_val - cy 
+        
+        if shape == 'circle':
+            if safe_max_radius**2 < dy**2:
+                continue 
+            dx = math.sqrt(safe_max_radius**2 - dy**2)
+        elif shape == 'square':
+            dx = safe_max_radius
+        else:
+            raise ValueError("Shape argument must be 'circle' or 'square'")
+            
+        x_left = cx - dx
+        x_right = cx + dx
+        
+        # Alternate sweep directions
+        iteration = int(round((y_val - y_start) / step_mm))
+        if iteration % 2 == 0:
+            waypoints.append([x_left, y_val])
+            waypoints.append([x_right, y_val])
+        else:
+            waypoints.append([x_right, y_val])
+            waypoints.append([x_left, y_val])
+            
     return waypoints
 
 def camera_thread_function():
@@ -300,11 +368,26 @@ def camera_thread_function():
                                         
                                     norm_grid = np.clip((grid_copy - 20.0) * (255.0 / (120.0 - 20.0)), 0, 255).astype(np.uint8)
                                     twin_display = cv2.applyColorMap(norm_grid, cv2.COLORMAP_INFERNO)
-                                    
-                                    # Draw a green circle showing the physical operation boundary
+
                                     cx, cy = int(BED_SIZE_MM / 2), int(BED_SIZE_MM / 2)
-                                    cv2.circle(twin_display, (cx, cy), int(WORKING_RADIUS_MM), (0, 255, 0), 2)
-                                    
+                                    outer_r = int(WORKING_RADIUS_MM)
+                                    safe_r = int(WORKING_RADIUS_MM - TOOL_RADIUS - MARGIN_MM)
+
+                                    # Draw the dynamic boundaries reflecting the current system state
+                                    if ACTIVE_SHAPE == 'circle':
+                                        # Green physical wall
+                                        cv2.circle(twin_display, (cx, cy), outer_r, (0, 255, 0), 2)
+                                        # Orange safe travel limit for the tool center
+                                        if safe_r > 0:
+                                            cv2.circle(twin_display, (cx, cy), safe_r, (0, 165, 255), 1)
+                                            
+                                    elif ACTIVE_SHAPE == 'square':
+                                        # Green physical wall
+                                        cv2.rectangle(twin_display, (cx - outer_r, cy - outer_r), (cx + outer_r, cy + outer_r), (0, 255, 0), 2)
+                                        # Orange safe travel limit for the tool center
+                                        if safe_r > 0:
+                                            cv2.rectangle(twin_display, (cx - safe_r, cy - safe_r), (cx + safe_r, cy + safe_r), (0, 165, 255), 1)
+
                                     # Draw a blue dot showing where the software thinks the gantry is
                                     cv2.circle(twin_display, (int(gx), int(gy)), 3, (255, 0, 0), -1)
                                     cv2.imshow("Thermal Twin", twin_display)
@@ -336,10 +419,15 @@ async def execute_modulated_sweep(axis_x, axis_y):
     """
     global current_gantry_pos, system_running
     
-    # waypoints = generate_circular_raster_path()
-    # waypoints = generate_spiral_path()
-    waypoints = generate_concentric_path()
-    print(f"Generated {len(waypoints)} sweep waypoints.")
+    # Route generation based on system state
+    if ACTIVE_PATTERN == 'lawnmower':
+        waypoints = generate_lawnmower_path(shape=ACTIVE_SHAPE, step_mm=RASTER_STEP, margin_mm=MARGIN_MM)
+    elif ACTIVE_PATTERN == 'concentric':
+        waypoints = generate_concentric_path(shape=ACTIVE_SHAPE, margin_mm=MARGIN_MM)
+    else:
+        waypoints = []
+        
+    print(f"Generated {len(waypoints)} waypoints for {ACTIVE_PATTERN} sweep on a {ACTIVE_SHAPE} sample.")
     
     for target_x, target_y in waypoints:
         if not system_running:
@@ -391,7 +479,7 @@ if __name__ == "__main__":
         with Connection.open_serial_port(PORT) as connection:
             connection.enable_alerts()
             device_list = connection.detect_devices()
-            device = device_list[0]
+            device = device_list[1]
             
             x = device.get_axis(2)
             y = device.get_axis(1)
@@ -404,7 +492,7 @@ if __name__ == "__main__":
             y.wait_until_idle()
             
             # Start the deterministic gantry sweep
-            await execute_modulated_sweep(x, y)
+            await execute_modulated_sweep(y, x)
 
     try:
         # Run the async routine

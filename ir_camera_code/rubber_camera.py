@@ -192,13 +192,13 @@ def acquire_and_display_images(cam, nodemap, nodemap_tldevice):
             # This section is important when the streaming is set to radiometric and not TempLinear
             # Image of temperature is calculated computer-side and not camera-side
             # Parameters can be set to the whole image, or for a particular ROI (not done here)
-            Emiss = 0.15
+            Emiss = 0.97
             TRefl = 293.15
             TAtm = 293.15
             TAtmC = TAtm - 273.15
             Humidity = 0.55
 
-            Dist = 2
+            Dist = 2.5
             ExtOpticsTransmission = 1
             ExtOpticsTemp = TAtm
 

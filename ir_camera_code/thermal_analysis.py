@@ -260,20 +260,14 @@ def load_transform_matrix(filename="transform_matrix.json"):
         matrix = np.array(json.load(f), dtype=np.float32)
     return matrix
 
-def calibrate_with_checkerboard(image_array, board_dims=(10, 8), square_size_mm=30.0, filename="transform_matrix.json"):
+def calibrate_with_checkerboard(image_array, board_dims=(8, 10), square_size_mm=30.0, filename="transform_matrix.json"):
     """
     Finds a thermal checkerboard in the image and computes a highly accurate homography matrix.
+    GUI calls have been removed for thread safety.
     """
-    # --- TUNE THESE TO ALIGN THE GREEN HUD BOX ---
-    # The matrix currently anchors (0,0) to the first checkerboard corner.
-    # Increase X to slide the green box LEFT across the image.
-    # Increase Y to slide the green box UP across the image.
     OFFSET_X_MM = 0.0  
     OFFSET_Y_MM = 0.0  
-    
-    # If the box is drawn rotated 90-degrees compared to your bed, change to True
     SWAP_AXES = False
-    # ---------------------------------------------
     
     vmin, vmax = np.percentile(image_array, (2, 98))
     clipped_array = np.clip(image_array, a_min=vmin, a_max=vmax)
@@ -281,13 +275,9 @@ def calibrate_with_checkerboard(image_array, board_dims=(10, 8), square_size_mm=
     gray_img = np.uint8(img_norm)
     gray_img = cv2.bitwise_not(gray_img)
     
-    cv2.imshow("OpenCV Debug View", gray_img)
-    cv2.waitKey(500) 
-    
     obj_points = np.zeros((board_dims[0] * board_dims[1], 3), np.float32)
     grid = np.mgrid[0:board_dims[0], 0:board_dims[1]].T.reshape(-1, 2)
     
-    # Apply the offsets and axis orientation
     if SWAP_AXES:
         obj_points[:, 0] = (grid[:, 1] * square_size_mm) + OFFSET_X_MM
         obj_points[:, 1] = (grid[:, 0] * square_size_mm) + OFFSET_Y_MM
@@ -308,13 +298,16 @@ def calibrate_with_checkerboard(image_array, board_dims=(10, 8), square_size_mm=
         pts_pixel = corners_subpix.reshape(-1, 2)
         matrix, status = cv2.findHomography(pts_pixel, pts_mm, cv2.RANSAC, 5.0)
         
+        # Draw the recognized corners onto the array so the main thread can display it
+        cv2.drawChessboardCorners(gray_img, board_dims, corners_subpix, found)
+        
         if os.path.exists(filename):
             os.remove(filename)
         with open(filename, "w") as f:
             json.dump(matrix.tolist(), f)
             
         print("Checkerboard calibration complete. Matrix saved.")
-        return matrix
+        return matrix, gray_img
     else:
         print("Failed to detect checkerboard. Ensure the thermal contrast is high enough.")
-        return None
+        return None, gray_img
