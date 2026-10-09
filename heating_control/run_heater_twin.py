@@ -83,6 +83,7 @@ class AsynchronousVideoCapture:
         # Start consumer thread
         self.worker_thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.worker_thread.start()
+        
     def _writer_loop(self):
         """Background thread worker that writes frames from the queue to disk."""
         while not self.stop_event.is_set() or not self.queue.empty():
@@ -100,6 +101,7 @@ class AsynchronousVideoCapture:
         # Release file resource when loop terminates
         if self.writer is not None:
             self.writer.release()
+
     def add_frame(self, frame):
         """Non-blocking method to add a frame to the queue. Drops frame if queue is full to preserve real-time gantry performance."""
         try:
@@ -107,6 +109,7 @@ class AsynchronousVideoCapture:
         except queue.Full:
             # Queue is full — drop video frame to prevent blocking control loop
             pass
+
     def stop(self):
         """Gracefully flushes remaining queued frames and closes video file."""
         self.stop_event.set()
@@ -343,7 +346,8 @@ def camera_thread_function():
                 inv_matrix = np.linalg.inv(transform_matrix)
                 closed_polygon_mm = np.array(OPERATING_SURFACE_MM + [OPERATING_SURFACE_MM[0]], dtype=np.float32).reshape(-1, 1, 2)
                 roi_pixels = cv2.perspectiveTransform(closed_polygon_mm, inv_matrix).reshape(-1, 2)
-
+            recorder = AsynchronousVideoCapture(filename="iMelt_Trial_", fps=20, frame_size=(640, 480), max_queue_size=30)
+            T_MIN, T_MAX = 20.0, 200.0  # Temperature range for color mapping
             while system_running:
                 try:
                                 image_result = cam.GetNextImage(1000)
@@ -355,6 +359,12 @@ def camera_thread_function():
                                     # Apply Radiometric Math
                                     image_Radiance = (image_data - J0) / J1
                                     image_Temp = (B / np.log(R / ((image_Radiance / Emiss / Tau) - K2) + F)) - 273.15
+
+                                    norm_temp = np.clip((image_Temp - T_MIN) / (T_MAX - T_MIN) * 255.0, 0, 255).astype(np.uint8)
+                                    color_frame = cv2.applyColorMap(norm_temp, cv2.COLORMAP_INFERNO) 
+                                    # --- NON-BLOCKING QUEUE PUSH --- 
+                                    recorder.add_frame(color_frame)
+
                                     # Get current gantry position
                                     gx, gy = current_gantry_pos[0], current_gantry_pos[1]
                                     
@@ -397,7 +407,7 @@ def camera_thread_function():
                 except PySpin.SpinnakerException as ex:
                                 print('Error: %s' % ex)
                                 return False
-                
+            recorder.stop()    
             cam.EndAcquisition()
         except PySpin.SpinnakerException as ex:
             print('Error: %s' % ex)
