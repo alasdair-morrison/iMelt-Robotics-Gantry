@@ -11,7 +11,7 @@ import PySpin
 import math
 from zaber_motion import Units
 from zaber_motion.ascii import Connection
-PORT = '/dev/ttyUSB0'
+PORT = '/dev/ttyACM0'
 # Ensure thermal_analysis can be imported
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -408,6 +408,7 @@ def camera_thread_function():
                                 print('Error: %s' % ex)
                                 return False
             recorder.stop()    
+            print("Camera recorder stopped and video file finalized.")
             cam.EndAcquisition()
         except PySpin.SpinnakerException as ex:
             print('Error: %s' % ex)
@@ -489,7 +490,7 @@ if __name__ == "__main__":
         with Connection.open_serial_port(PORT) as connection:
             connection.enable_alerts()
             device_list = connection.detect_devices()
-            device = device_list[1]
+            device = device_list[0]
             
             x = device.get_axis(2)
             y = device.get_axis(1)
