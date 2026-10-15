@@ -1,4 +1,0 @@
-Vertical gantry 100mm option: https://www.zaber.com/products/linear-stages/X-LRT-EC/specs?part=X-LRT0100BL-BE08C
-Mounting Bracket: https://www.zaber.com/products/accessories/AB151
-Vertical gantry exactly 40mm option: https://www.zaber.com/products/vertical-stages/X-VSR/specs?part=X-VSR40A
-New daisy-chain connector: https://www.zaber.com/products/accessories/X-DC06
