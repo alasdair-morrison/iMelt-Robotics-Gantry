@@ -11,7 +11,7 @@ from zaber_motion import Units
 from zaber_motion.ascii import Connection
 import matplotlib.pyplot as plt
 matplotlib.use('TkAgg')  # Use TkAgg backend for matplotlib
-from Simulation.hilbert_path_generator import generate_dynamic_hilbert_waypoints, fillet_corners
+from hilbert_path_generator import generate_dynamic_hilbert_waypoints, fillet_corners
 
 BED_SIZE_MM = 250.0
 WORKING_RADIUS_MM = 75.0   # mm
@@ -459,17 +459,60 @@ class HeaterSimulation:
             dt = 5.0 / speed
             self.apply_heating(target_x, target_y, voltage=voltage, dt=dt)
 
-    def run(self):
+    @staticmethod
+    def analyze_run(thermal_twin, target_temp=TARGET_TEMP, max_saftey_temp=SAFTEY_MAX_TEMP, active_mask=None):
+        with thermal_twin.lock:
+            if active_mask is None:
+                core_temps = thermal_twin.grid_core[thermal_twin.boundary_mask == 1]
+            else:
+                mask = (thermal_twin.boundary_mask == 1) & active_mask
+            core_temps = thermal_twin.grid_core[mask]
+
+        mean_temp = float(np.mean(core_temps))
+        max_temp = float(np.max(core_temps))
+        min_temp = float(np.min(core_temps))
+        std_temp = float(np.std(core_temps))
+
+        if max_temp > max_saftey_temp:
+            return {
+                "score": -9999.0,
+                "status": "FAILURE: SAFTEY MAX TEMP EXCEEDED",
+                "max_temp": max_temp,
+            }
+
+        mae = np.mean(np.abs(core_temps - target_temp))
+        accuracy_score = 100.0 * np.exp(-mae / 10.0)
+
+        overshoots = np.maximum(0.0, core_temps - target_temp)
+        overshoot_penalty = np.mean((overshoots / (max_saftey_temp - target_temp)) ** 2) * 500.0
+
+        uniformity_penalty = std_temp * 2.0
+
+        final_score = accuracy_score - overshoot_penalty - uniformity_penalty
+
+        return {
+            "score": round(final_score, 2),
+            "status": "SUCCESS",
+            "mean_temp": round(mean_temp, 2),
+            "max_temp": round(max_temp, 1),
+            "min_temp": round(min_temp, 1),
+            "std_temp": round(std_temp, 2),
+            "accuracy_score": round(accuracy_score, 2),
+            "overshoot_penalty": round(overshoot_penalty, 2),
+            "uniformity_penalty": round(uniformity_penalty, 2)
+        }
+
+    def graphic_run(self, shape=ACTIVE_SHAPE, pattern=ACTIVE_PATTERN):
         """ Main loop displaying both Internal Core Temp and Outer Silicone Surface Temp. """
         voltage = 70.0
-        if ACTIVE_PATTERN == 'concentric':
-            waypoints = self.generate_concentric_path(shape=ACTIVE_SHAPE)
-        elif ACTIVE_PATTERN == 'spiral':
+        if pattern == 'concentric':
+            waypoints = self.generate_concentric_path(shape=shape)
+        elif pattern == 'spiral':
             waypoints = self.generate_spiral_path()
-        elif ACTIVE_PATTERN == 'hilbert':
+        elif pattern == 'hilbert':
             waypoints = self.generate_hilbert_path()
         else:
-            waypoints = self.generate_lawnmower_path(shape=ACTIVE_SHAPE)
+            waypoints = self.generate_lawnmower_path(shape=shape)
         b_mask = self.thermal_twin.boundary_mask == 1
 
         size = self.thermal_twin.size
@@ -503,7 +546,7 @@ class HeaterSimulation:
 
         avg_core = float(np.mean(self.thermal_twin.grid_core[active_zone_mask]))
         max_core_temp = float(np.max(self.thermal_twin.grid_core[b_mask]))
-        while avg_core < (0.95 * TARGET_TEMP):
+        while avg_core < (0.98 * TARGET_TEMP):
             self.execute_path(waypoints, speed_min=MIN_SPEED, speed_max=MAX_SPEED, target_temp=TARGET_TEMP, voltage=voltage)
             self.cold_point_loop(speed_min=MIN_SPEED, speed_max=MAX_SPEED, target_temp=TARGET_TEMP, voltage=voltage, max_iterations=30)
 
@@ -527,7 +570,58 @@ class HeaterSimulation:
 
         plt.ioff()
         plt.show()
+        score = self.analyze_run(self.thermal_twin, target_temp=TARGET_TEMP, max_saftey_temp=SAFTEY_MAX_TEMP, active_mask=active_zone_mask)
+        print("\nFinal Run Analysis:")
+        for key, value in score.items():
+            print(f"{key}: {value}")
         return True
 
+    def diagnostic_run(self, shape=ACTIVE_SHAPE):
+            """ Tests all 4 path patterns for given shape and reports final score for each. """
+            voltage = 70.0
+            scores = {}
+            concentric_waypoints = self.generate_concentric_path(shape=shape)
+            spiral_waypoints = self.generate_spiral_path()
+            hilbert_waypoints = self.generate_hilbert_path()
+            lawnmower_waypoints = self.generate_lawnmower_path(shape=shape)
+            b_mask = self.thermal_twin.boundary_mask == 1
+            size = self.thermal_twin.size
+            cx, cy = size / 2.0, size / 2.0
+            y_idx, x_idx = np.ogrid[:size, :size]
+            reachable_radius = self.thermal_twin.radius - MARGIN_MM
+            active_zone_mask = ((x_idx - cx)**2 + (y_idx - cy)**2) <= (reachable_radius**2)
+            for pattern_name, waypoints in [("Concentric", concentric_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints)]:
+                print(f"\nStarting {pattern_name} Path Test...")
+                self.thermal_twin = ThermalTwin()
+                avg_core = float(np.mean(self.thermal_twin.grid_core[active_zone_mask]))
+                max_core_temp = float(np.max(self.thermal_twin.grid_core[b_mask]))
+                while avg_core < (0.98 * TARGET_TEMP):
+                    self.execute_path(waypoints, speed_min=MIN_SPEED, speed_max=MAX_SPEED, target_temp=TARGET_TEMP, voltage=voltage)
+                    self.cold_point_loop(speed_min=MIN_SPEED, speed_max=MAX_SPEED, target_temp=TARGET_TEMP, voltage=voltage, max_iterations=30)
+        
+                    avg_core = float(np.mean(self.thermal_twin.grid_core[active_zone_mask]))
+                    max_core_temp = float(np.max(self.thermal_twin.grid_core[b_mask]))
+                    avg_surf = float(np.mean(self.thermal_twin.grid_surface[active_zone_mask]))
+                    max_surf = float(np.max(self.thermal_twin.grid_surface[b_mask]))
+        
+                    print(f"Core [Avg: {avg_core:.1f}°C, Max: {max_core_temp:.1f}°C] | "
+                        f"Silicone Surface [Avg: {avg_surf:.1f}°C, Max: {max_surf:.1f}°C]")
+        
+                score = self.analyze_run(self.thermal_twin, target_temp=TARGET_TEMP, max_saftey_temp=SAFTEY_MAX_TEMP, active_mask=active_zone_mask)
+                print(f"\nFinal Run Analysis of {pattern_name} Path:")
+                for key, value in score.items():
+                    print(f"{key}: {value}")
+                scores[pattern_name] = score
+            print("\nSummary of All Path Tests:")
+            for pattern_name, score in scores.items():
+                print(f"{pattern_name} Path Score: {score['score']}")
+                if score['score'] > 0:
+                    print(f"  Mean Temp: {score['mean_temp']}°C, Max Temp: {score['max_temp']}°C, Std Dev: {score['std_temp']}°C")
+                    print(f"  Accuracy Score: {score['accuracy_score']}, Overshoot Penalty: {score['overshoot_penalty']}, Uniformity Penalty: {score['uniformity_penalty']}")
+                else:
+                    print(f"  Status: {score['status']}")
+            return scores
+
 heater_Sim = HeaterSimulation()
-heater_Sim.run()
+# heater_Sim.graphic_run("square", "hilbert")
+heater_Sim.diagnostic_run("square")
