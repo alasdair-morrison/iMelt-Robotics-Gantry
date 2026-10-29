@@ -2,7 +2,7 @@ import os
 import shutil
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 
 def hilbert_d2xy(order, d):

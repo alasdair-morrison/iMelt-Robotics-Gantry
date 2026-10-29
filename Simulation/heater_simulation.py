@@ -10,7 +10,7 @@ import math
 from zaber_motion import Units
 from zaber_motion.ascii import Connection
 import matplotlib.pyplot as plt
-matplotlib.use('TkAgg')  # Use TkAgg backend for matplotlib
+matplotlib.use('Qt5Agg')  # Use TkAgg backend for matplotlib
 from hilbert_path_generator import generate_dynamic_hilbert_waypoints, fillet_corners
 
 BED_SIZE_MM = 250.0
