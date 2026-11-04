@@ -7,8 +7,6 @@ import threading
 import numpy as np
 import cv2
 import math
-from zaber_motion import Units
-from zaber_motion.ascii import Connection
 import matplotlib.pyplot as plt
 matplotlib.use('Qt5Agg')  # Use TkAgg backend for matplotlib
 from hilbert_path_generator import generate_dynamic_hilbert_waypoints, fillet_corners
@@ -365,6 +363,43 @@ class HeaterSimulation:
         smooth_waypoints = fillet_corners(raw_pts, fillet_radius=fillet_r, arc_resolution=5)
         return smooth_waypoints
 
+    @staticmethod
+    def generate_cross_hatch_path(size_mm=BED_SIZE_MM, step_mm=RASTER_STEP, radius_mm=WORKING_RADIUS_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM, shape='square'):
+        """ Generates a cross-hatch pattern by overlaying two orthogonal lawnmower sweeps. """
+        waypoints = HeaterSimulation.generate_lawnmower_path(size_mm=size_mm, step_mm=step_mm, radius_mm=radius_mm, puck_radius=puck_radius, margin_mm=margin_mm, shape=shape)
+        # Rotate the waypoints by 90 degrees around the center to create the second sweep
+        cx, cy = size_mm / 2.0, size_mm / 2.0
+        rotated_waypoints = []
+        for x, y in waypoints:
+            x_rot = cx - (y - cy)
+            y_rot = cy + (x - cx)
+            rotated_waypoints.append([x_rot, y_rot])
+        # Combine both sweeps into a single path
+        combined_waypoints = waypoints + rotated_waypoints
+        return combined_waypoints
+
+    @staticmethod
+    def generate_lissajous_path( sample_size=BED_SIZE_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM, freq_x=7, freq_y=8, phase_shift=np.pi / 2, target_step_mm=3.0 ):
+        """ Generates a smooth Lissajous Harmonic Mesh trajectory resampled at constant arc-length step intervals. """ 
+        margin = puck_radius + margin_mm 
+        usable_span = sample_size - 2.0 * margin 
+        amplitude = usable_span / 2.0 
+        cx, cy = sample_size / 2.0, sample_size / 2.0 
+        # Dense evaluation for arc-length parametrization 
+        t_dense = np.linspace(0, 2.0 * np.pi, 20000) 
+        x_dense = cx + amplitude * np.sin(freq_x * t_dense + phase_shift) 
+        y_dense = cy + amplitude * np.sin(freq_y * t_dense) 
+        # Cumulative arc length 
+        ds = np.sqrt(np.diff(x_dense)**2 + np.diff(y_dense)**2) 
+        s = np.concatenate(([0], np.cumsum(ds))) 
+        # Resample at fixed distance intervals 
+        total_length = s[-1] 
+        num_pts = max(2, int(np.ceil(total_length / target_step_mm))) 
+        s_uniform = np.linspace(0, total_length, num_pts) 
+        x_uniform = np.interp(s_uniform, s, x_dense) 
+        y_uniform = np.interp(s_uniform, s, y_dense)
+        return np.column_stack((x_uniform, y_uniform))
+
     def execute_path(self, waypoints, speed_min=MIN_SPEED, speed_max=MAX_SPEED, target_temp=TARGET_TEMP, voltage=70.0):
         """
         Inverse-speed (linear energy) controller with radial perimeter compensation.
@@ -422,7 +457,7 @@ class HeaterSimulation:
         safe_max_radius = max(0.0, self.thermal_twin.radius - self.heater_radius - MARGIN_MM)
         y_indices, x_indices = np.ogrid[:size, :size]
 
-        for _ in range(max_iterations):
+        for i in range(max_iterations):
             with self.thermal_twin.lock:
                 # Only look for cold points within the reachable heated zone
                 reach_mask = ((x_indices - cx)**2 + (y_indices - cy)**2) <= ((safe_max_radius + self.heater_radius * 0.5)**2)
@@ -584,17 +619,20 @@ class HeaterSimulation:
             spiral_waypoints = self.generate_spiral_path()
             hilbert_waypoints = self.generate_hilbert_path()
             lawnmower_waypoints = self.generate_lawnmower_path(shape=shape)
+            lissajous_waypoints = self.generate_lissajous_path()
+            crosshatch_waypoints = self.generate_cross_hatch_path(shape=shape)
             b_mask = self.thermal_twin.boundary_mask == 1
             size = self.thermal_twin.size
             cx, cy = size / 2.0, size / 2.0
             y_idx, x_idx = np.ogrid[:size, :size]
             reachable_radius = self.thermal_twin.radius - MARGIN_MM
             active_zone_mask = ((x_idx - cx)**2 + (y_idx - cy)**2) <= (reachable_radius**2)
-            for pattern_name, waypoints in [("Concentric", concentric_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints)]:
+            for pattern_name, waypoints in [("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints)]:
                 print(f"\nStarting {pattern_name} Path Test...")
                 self.thermal_twin = ThermalTwin()
                 avg_core = float(np.mean(self.thermal_twin.grid_core[active_zone_mask]))
                 max_core_temp = float(np.max(self.thermal_twin.grid_core[b_mask]))
+                
                 while avg_core < (0.98 * TARGET_TEMP):
                     self.execute_path(waypoints, speed_min=MIN_SPEED, speed_max=MAX_SPEED, target_temp=TARGET_TEMP, voltage=voltage)
                     self.cold_point_loop(speed_min=MIN_SPEED, speed_max=MAX_SPEED, target_temp=TARGET_TEMP, voltage=voltage, max_iterations=30)
@@ -625,3 +663,7 @@ class HeaterSimulation:
 heater_Sim = HeaterSimulation()
 # heater_Sim.graphic_run("square", "hilbert")
 heater_Sim.diagnostic_run("square")
+
+"""
+I want to add a timer ability so I can know how long each simulation takes to run. how do I best implement that in python? This isn't for scoring, just for assessing if I can run this simulation in real time during experiments or if it is too slow
+"""
