@@ -663,7 +663,3 @@ class HeaterSimulation:
 heater_Sim = HeaterSimulation()
 # heater_Sim.graphic_run("square", "hilbert")
 heater_Sim.diagnostic_run("square")
-
-"""
-I want to add a timer ability so I can know how long each simulation takes to run. how do I best implement that in python? This isn't for scoring, just for assessing if I can run this simulation in real time during experiments or if it is too slow
-"""
