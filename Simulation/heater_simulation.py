@@ -9,7 +9,6 @@ import cv2
 import math
 import matplotlib.pyplot as plt
 matplotlib.use('Qt5Agg')  # Use TkAgg backend for matplotlib
-from hilbert_path_generator import generate_dynamic_hilbert_waypoints, fillet_corners
 
 BED_SIZE_MM = 250.0
 WORKING_RADIUS_MM = 75.0   # mm
@@ -119,6 +118,7 @@ class HeaterSimulation:
     def __init__(self, heater_radius_mm=TOOL_RADIUS):
         self.thermal_twin = ThermalTwin()
         self.heater_radius = heater_radius_mm  
+        self.scores = None  # Store benchmark scores for later analysis
 
     def apply_heating(self, g_x, g_y, voltage, dt=0.1):
         """
@@ -366,6 +366,141 @@ class HeaterSimulation:
 
     @staticmethod
     def generate_hilbert_path(size_mm=BED_SIZE_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM):
+        def hilbert_d2xy(order, d):
+            """
+            Map 1D distance d (0 to 4^order - 1) to 2D grid coordinates (x, y)
+            for a Hilbert curve of given order (grid size N = 2^order).
+            """
+            n = 2 ** order
+            rx, ry, s, t = 0, 0, 1, d
+            x, y = 0, 0
+            
+            while s < n:
+                rx = 1 & (t // 2)
+                ry = 1 & (t ^ rx)
+                if ry == 0:
+                    if rx == 1:
+                        x = s - 1 - x
+                        y = s - 1 - y
+                    x, y = y, x
+                x += s * rx
+                y += s * ry
+                t //= 4
+                s *= 2
+            return x, y
+
+        def calculate_optimal_hilbert_order(sample_size, induction_radius, safety_clearance=2.0):
+            """
+            Dynamically computes the optimal Hilbert curve order based on sample size and coil radius.
+            Ensures path pitch matches the effective thermal diameter of the induction coil (~2 * radius).
+            """
+            margin = induction_radius + safety_clearance
+            usable_span = sample_size - 2 * margin
+            if usable_span <= 0:
+                raise ValueError(f"Sample size ({sample_size} mm) is too small for coil radius ({induction_radius} mm) + clearance ({safety_clearance} mm).")
+
+            # Ideal pitch between passes ~ 2 * induction_radius
+            target_pitch = 2.0 * induction_radius
+            
+            # N_intervals = 2^order - 1 = usable_span / target_pitch
+            ideal_intervals = usable_span / target_pitch
+            
+            # Choose order such that 2^order is closest to ideal_intervals + 1
+            if ideal_intervals < 1:
+                order = 1
+            else:
+                order = int(np.round(np.log2(ideal_intervals + 1)))
+                order = max(1, min(order, 6))  # Cap order between 1 and 6 for gantry practicality
+                
+            return order, margin
+
+        def generate_dynamic_hilbert_waypoints(sample_size=250.0, induction_radius=10.0, safety_clearance=2.0, order=None):
+            """
+            Generates parametrically scaled (x, y) Hilbert waypoints adapted to variable sample size & coil radius.
+            """
+            if order is None:
+                order, margin = calculate_optimal_hilbert_order(sample_size, induction_radius, safety_clearance)
+            else:
+                margin = induction_radius + safety_clearance
+
+            n_points = 4 ** order
+            raw_pts = np.array([hilbert_d2xy(order, i) for i in range(n_points)], dtype=np.float64)
+            
+            grid_max = (2 ** order) - 1
+            usable_span = sample_size - 2 * margin
+            
+            if grid_max == 0:
+                scaled_x = np.full(n_points, sample_size / 2.0)
+                scaled_y = np.full(n_points, sample_size / 2.0)
+            else:
+                scaled_x = margin + (raw_pts[:, 0] / grid_max) * usable_span
+                scaled_y = margin + (raw_pts[:, 1] / grid_max) * usable_span
+                
+            grid_pitch = usable_span / grid_max if grid_max > 0 else usable_span
+            
+            return np.column_stack((scaled_x, scaled_y)), order, margin, grid_pitch
+
+        def fillet_corners(waypoints, fillet_radius=3.5, arc_resolution=5):
+            """
+            Inserts circular arc fillets at 90-degree corners to allow continuous
+            gantry feedrates without corner deceleration stalls.
+            """
+            if len(waypoints) < 3:
+                return waypoints
+
+            filleted_pts = [waypoints[0]]
+
+            for i in range(1, len(waypoints) - 1):
+                p_prev = waypoints[i - 1]
+                p_curr = waypoints[i]
+                p_next = waypoints[i + 1]
+
+                v1 = p_prev - p_curr
+                v2 = p_next - p_curr
+
+                len1 = np.linalg.norm(v1)
+                len2 = np.linalg.norm(v2)
+
+                if len1 < 1e-5 or len2 < 1e-5:
+                    filleted_pts.append(p_curr)
+                    continue
+
+                u1 = v1 / len1
+                u2 = v2 / len2
+
+                dot = np.dot(u1, u2)
+                if abs(dot) < 0.1:  # Right-angle corner
+                    r = min(fillet_radius, len1 / 2.5, len2 / 2.5)
+                    
+                    start_tangent = p_curr + u1 * r
+                    end_tangent = p_curr + u2 * r
+
+                    bisector = u1 + u2
+                    bisector_norm = np.linalg.norm(bisector)
+                    if bisector_norm > 1e-5:
+                        bisector /= bisector_norm
+                    
+                    center = p_curr + bisector * (r * np.sqrt(2))
+
+                    angle_start = np.arctan2(start_tangent[1] - center[1], start_tangent[0] - center[0])
+                    angle_end = np.arctan2(end_tangent[1] - center[1], end_tangent[0] - center[0])
+
+                    d_angle = angle_end - angle_start
+                    if d_angle > np.pi:
+                        d_angle -= 2 * np.pi
+                    elif d_angle < -np.pi:
+                        d_angle += 2 * np.pi
+
+                    angles = np.linspace(angle_start, angle_start + d_angle, arc_resolution)
+                    arc_pts = np.column_stack((center[0] + r * np.cos(angles), center[1] + r * np.sin(angles)))
+                    
+                    filleted_pts.extend(arc_pts)
+                else:
+                    filleted_pts.append(p_curr)
+
+            filleted_pts.append(waypoints[-1])
+            return np.array(filleted_pts)
+
         """ Generates a dynamically scaled, filleted Hilbert space-filling curve conforming to a square workpiece boundary. """
         # Compute dynamic waypoints, optimal order n, and pitch
         raw_pts, order, margin, pitch = generate_dynamic_hilbert_waypoints( sample_size=size_mm, induction_radius=puck_radius, safety_clearance=margin_mm )
@@ -391,28 +526,38 @@ class HeaterSimulation:
 
     @staticmethod
     def generate_lissajous_path( sample_size=BED_SIZE_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM, freq_x=7, freq_y=8, phase_shift=np.pi / 2, target_step_mm=3.0 ):
-        """ Generates a smooth Lissajous Harmonic Mesh trajectory resampled at constant arc-length step intervals. """ 
-        margin = puck_radius + margin_mm 
-        usable_span = sample_size - 2.0 * margin 
-        amplitude = usable_span / 2.0 
-        cx, cy = sample_size / 2.0, sample_size / 2.0 
-        # Dense evaluation for arc-length parametrization 
-        t_dense = np.linspace(0, 2.0 * np.pi, 20000) 
-        x_dense = cx + amplitude * np.sin(freq_x * t_dense + phase_shift) 
-        y_dense = cy + amplitude * np.sin(freq_y * t_dense) 
-        # Cumulative arc length 
-        ds = np.sqrt(np.diff(x_dense)**2 + np.diff(y_dense)**2) 
-        s = np.concatenate(([0], np.cumsum(ds))) 
-        # Resample at fixed distance intervals 
-        total_length = s[-1] 
-        num_pts = max(2, int(np.ceil(total_length / target_step_mm))) 
-        s_uniform = np.linspace(0, total_length, num_pts) 
-        x_uniform = np.interp(s_uniform, s, x_dense) 
+        
+        """
+        Generates a smooth one-cycle Lissajous trajectory at approximately
+        uniform arc-length intervals.
+        """
+        margin = puck_radius + margin_mm
+        usable_span = sample_size - 2.0 * margin
+
+        if usable_span <= 0:
+            raise ValueError(f"Sample size ({sample_size} mm) too small for coil radius + clearance.")
+
+        cx = sample_size / 2.0
+        cy = sample_size / 2.0
+        amplitude = usable_span / 2.0
+
+        t_dense = np.linspace(0.0, 2.0 * np.pi, 20000)
+        x_dense = cx + amplitude * np.sin(freq_x * t_dense + phase_shift)
+        y_dense = cy + amplitude * np.sin(freq_y * t_dense)
+
+        ds = np.sqrt(np.diff(x_dense) ** 2 + np.diff(y_dense) ** 2)
+        s = np.concatenate(([0.0], np.cumsum(ds)))
+
+        total_path_length = s[-1]
+        num_waypoints = max(2, int(np.ceil(total_path_length / target_step_mm)))
+        s_uniform = np.linspace(0.0, total_path_length, num_waypoints)
+
+        x_uniform = np.interp(s_uniform, s, x_dense)
         y_uniform = np.interp(s_uniform, s, y_dense)
         return np.column_stack((x_uniform, y_uniform))
 
     @staticmethod
-    def generate_moore_path(size_mm=BED_SIZE_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM):
+    def generate_simple_moore_path(size_mm=BED_SIZE_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM):
         """ Generates a Moore Curve (closed-loop Hilbert variant) for continuous coverage of a square workpiece. """
         raw_pts, order, margin, pitch = generate_dynamic_hilbert_waypoints( sample_size=size_mm, induction_radius=puck_radius, safety_clearance=margin_mm )
         # Convert Hilbert to Moore by appending the starting point to the end
@@ -422,6 +567,167 @@ class HeaterSimulation:
         smooth_waypoints = fillet_corners(moore_pts, fillet_radius=fillet_r, arc_resolution=5)
         return smooth_waypoints
 
+    @staticmethod
+    def generate_moore_path(size_mm=BED_SIZE_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM):
+        def generate_moore_raw_points(order):
+            """
+            Generates integer grid coordinates for a Moore curve of specified order (N = 2^order).
+            """
+
+            if order < 1:
+                order = 1
+            s = "LFL+F+LFL"
+            for _ in range(order - 1):
+                next_s = []
+                for ch in s:
+                    if ch == 'L':
+                        next_s.append("-RF+LFL+FR-")
+                    elif ch == 'R':
+                        next_s.append("+LF-RFR-FL+")
+                    else:
+                        next_s.append(ch)
+                s = "".join(next_s)
+                
+            x, y = 0.0, 0.0
+            angle = 0  # 0: +x, 1: +y, 2: -x, 3: -y
+            dirs = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)]
+            
+            pts = [(x, y)]
+            for ch in s:
+                if ch == 'F':
+                    x += dirs[angle][0]
+                    y += dirs[angle][1]
+                    pts.append((x, y))
+                elif ch == '+':
+                    angle = (angle + 1) % 4
+                elif ch == '-':
+                    angle = (angle - 1) % 4
+                    
+            pts = np.array(pts, dtype=np.float64)
+            # Normalize coordinates so min is (0, 0)
+            pts[:, 0] -= pts[:, 0].min()
+            pts[:, 1] -= pts[:, 1].min()
+            return pts
+
+        def calculate_optimal_moore_order(sample_size, induction_radius, safety_clearance=2.0):
+            """
+            Calculates the optimal Moore curve order based on sample dimension and coil radius.
+            Target pitch between passes ~ 2 * induction_radius.
+            """
+            margin = induction_radius + safety_clearance
+            usable_span = sample_size - 2.0 * margin
+            if usable_span <= 0:
+                raise ValueError(f"Sample size ({sample_size} mm) is too small for coil radius ({induction_radius} mm) + clearance ({safety_clearance} mm).")
+
+            target_pitch = 2.0 * induction_radius
+            ideal_intervals = usable_span / target_pitch
+            
+            if ideal_intervals < 1:
+                order = 1
+            else:
+                order = int(np.round(np.log2(ideal_intervals + 1)))
+                order = max(1, min(order, 6))
+                
+            return order, margin
+
+        def generate_dynamic_moore_waypoints(sample_size=250.0, induction_radius=10.0, safety_clearance=2.0, order=None, close_loop=True):
+            """
+            Generates parametrically scaled (x, y) Moore waypoints adapted to variable sample size & coil radius.
+            Optionally closes the loop back to the start point.
+            """
+            if order is None:
+                order, margin = calculate_optimal_moore_order(sample_size, induction_radius, safety_clearance)
+            else:
+                margin = induction_radius + safety_clearance
+
+            raw_pts = generate_moore_raw_points(order)
+            grid_max = (2 ** order) - 1
+            usable_span = sample_size - 2.0 * margin
+            
+            if grid_max == 0:
+                scaled_x = np.full(len(raw_pts), sample_size / 2.0)
+                scaled_y = np.full(len(raw_pts), sample_size / 2.0)
+            else:
+                scaled_x = margin + (raw_pts[:, 0] / grid_max) * usable_span
+                scaled_y = margin + (raw_pts[:, 1] / grid_max) * usable_span
+                
+            scaled_pts = np.column_stack((scaled_x, scaled_y))
+            
+            # If close_loop is True, append the start point to complete the loop
+            if close_loop:
+                scaled_pts = np.vstack((scaled_pts, scaled_pts[0]))
+                
+            grid_pitch = usable_span / grid_max if grid_max > 0 else usable_span
+            return scaled_pts, order, margin, grid_pitch
+
+        def fillet_corners(waypoints, fillet_radius=3.5, arc_resolution=5):
+            """
+            Inserts circular arc fillets at 90-degree corners to allow continuous
+            gantry feedrates without corner deceleration stalls.
+            """
+            if len(waypoints) < 3:
+                return waypoints
+
+            filleted_pts = [waypoints[0]]
+
+            for i in range(1, len(waypoints) - 1):
+                p_prev = waypoints[i - 1]
+                p_curr = waypoints[i]
+                p_next = waypoints[i + 1]
+
+                v1 = p_prev - p_curr
+                v2 = p_next - p_curr
+
+                len1 = np.linalg.norm(v1)
+                len2 = np.linalg.norm(v2)
+
+                if len1 < 1e-5 or len2 < 1e-5:
+                    filleted_pts.append(p_curr)
+                    continue
+
+                u1 = v1 / len1
+                u2 = v2 / len2
+
+                dot = np.dot(u1, u2)
+                if abs(dot) < 0.1:  # Right-angle corner
+                    r = min(fillet_radius, len1 / 2.5, len2 / 2.5)
+                    
+                    start_tangent = p_curr + u1 * r
+                    end_tangent = p_curr + u2 * r
+
+                    bisector = u1 + u2
+                    bisector_norm = np.linalg.norm(bisector)
+                    if bisector_norm > 1e-5:
+                        bisector /= bisector_norm
+                    
+                    center = p_curr + bisector * (r * np.sqrt(2))
+
+                    angle_start = np.arctan2(start_tangent[1] - center[1], start_tangent[0] - center[0])
+                    angle_end = np.arctan2(end_tangent[1] - center[1], end_tangent[0] - center[0])
+
+                    d_angle = angle_end - angle_start
+                    if d_angle > np.pi:
+                        d_angle -= 2 * np.pi
+                    elif d_angle < -np.pi:
+                        d_angle += 2 * np.pi
+
+                    angles = np.linspace(angle_start, angle_start + d_angle, arc_resolution)
+                    arc_pts = np.column_stack((center[0] + r * np.cos(angles), center[1] + r * np.sin(angles)))
+                    
+                    filleted_pts.extend(arc_pts)
+                else:
+                    filleted_pts.append(p_curr)
+
+            filleted_pts.append(waypoints[-1])
+            return np.array(filleted_pts)
+
+        """ Generates a Moore Curve (closed-loop Hilbert variant) for continuous coverage of a square workpiece. """
+        moore_pts, order, margin, pitch = generate_dynamic_moore_waypoints( sample_size=size_mm, induction_radius=puck_radius, safety_clearance=margin_mm, close_loop=True)
+        # Fillet corners for smooth gantry motion
+        fillet_r = min(3.5, pitch / 3.0)
+        smooth_waypoints = fillet_corners(moore_pts, fillet_radius=fillet_r, arc_resolution=5)
+        return smooth_waypoints
+    
     def execute_path(self, waypoints, speed_min=MIN_SPEED, speed_max=MAX_SPEED, target_temp=TARGET_TEMP, voltage=70.0):
         """
         Inverse-speed (linear energy) controller with radial perimeter compensation.
@@ -546,10 +852,10 @@ class HeaterSimulation:
         uniformity_penalty = std_temp * 2.0
 
         final_score = accuracy_score - overshoot_penalty - uniformity_penalty
-
+        status = "SUCCESS" if final_score > 0 else "FAILURE: LOW SCORE"
         return {
             "score": round(final_score, 2),
-            "status": "SUCCESS",
+            "status": status,
             "mean_temp": round(mean_temp, 2),
             "max_temp": round(max_temp, 1),
             "min_temp": round(min_temp, 1),
@@ -627,6 +933,8 @@ class HeaterSimulation:
 
         plt.ioff()
         plt.show()
+        self.plot_benchmark_results(scores)
+        self.scores = scores
         score = self.analyze_run(self.thermal_twin, target_temp=TARGET_TEMP, max_saftey_temp=SAFTEY_MAX_TEMP, active_mask=active_zone_mask)
         print("\nFinal Run Analysis:")
         for key, value in score.items():
@@ -643,6 +951,7 @@ class HeaterSimulation:
             lawnmower_waypoints = self.generate_lawnmower_path(shape=shape)
             lissajous_waypoints = self.generate_lissajous_path()
             crosshatch_waypoints = self.generate_cross_hatch_path(shape=shape)
+            simple_moore_waypoints = self.generate_simple_moore_path()
             moore_waypoints = self.generate_moore_path()
             b_mask = self.thermal_twin.boundary_mask == 1
             size = self.thermal_twin.size
@@ -650,7 +959,7 @@ class HeaterSimulation:
             y_idx, x_idx = np.ogrid[:size, :size]
             reachable_radius = self.thermal_twin.radius - MARGIN_MM
             active_zone_mask = ((x_idx - cx)**2 + (y_idx - cy)**2) <= (reachable_radius**2)         # Full test commented out for short runtimes
-            for pattern_name, waypoints in [('Hilbert', hilbert_waypoints), ('Moore', moore_waypoints)]: #[("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints)]:
+            for pattern_name, waypoints in [('Hilbert', hilbert_waypoints), ('Lissajous', lissajous_waypoints), ('Moore', moore_waypoints), ('Simple Moore', simple_moore_waypoints)]: #[("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints)]:
                 print(f"\nStarting {pattern_name} Path Test...")
                 self.thermal_twin = ThermalTwin()
                 avg_core = float(np.mean(self.thermal_twin.grid_core[active_zone_mask]))
@@ -681,8 +990,35 @@ class HeaterSimulation:
                     print(f"  Accuracy Score: {score['accuracy_score']}, Overshoot Penalty: {score['overshoot_penalty']}, Uniformity Penalty: {score['uniformity_penalty']}")
                 else:
                     print(f"  Status: {score['status']}")
+                    if score['status'] == "FAILURE: SAFTEY MAX TEMP EXCEEDED":
+                        print(f"  Max Temp: {score['max_temp']}°C exceeded safety limit of {SAFTEY_MAX_TEMP}°C")
+                    elif score['status'] == "FAILURE: LOW SCORE":
+                        print(f"  Mean Temp: {score['mean_temp']}°C, Max Temp: {score['max_temp']}°C, Std Dev: {score['std_temp']}°C")
+            self.scores = scores
+            self.plot_benchmark_results(scores)
             return scores
+    def plot_benchmark_results(self, scores):
+        """ Plots a bar chart comparing the scores of different path patterns. """
+        pattern_names = list(scores.keys())
+        score_values = [scores[name]['score'] for name in pattern_names]
+
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(pattern_names, score_values, color='skyblue')
+        plt.axhline(0, color='red', linewidth=1, linestyle='--')
+        plt.title("Benchmark Scores of Path Patterns")
+        plt.ylabel("Score")
+        plt.xlabel("Path Pattern")
+        plt.xticks(rotation=45)
+        
+        # Annotate bars with score values
+        for bar, score in zip(bars, score_values):
+            height = bar.get_height()
+            plt.annotate(f'{score:.2f}', xy=(bar.get_x() + bar.get_width() / 2, height),
+                         xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
+
+        plt.tight_layout()
+        plt.show()
 
 heater_Sim = HeaterSimulation()
 # heater_Sim.graphic_run("square", "hilbert")
-heater_Sim.diagnostic_run("square")
+scores = heater_Sim.diagnostic_run("square")
