@@ -305,15 +305,26 @@ class HeaterSimulation:
                 
             x_left = cx - dx
             x_right = cx + dx
+
+            segment_dist = x_right - x_left
+            if segment_dist <= 0:
+                waypoints.append([cx, y_val])
+                continue
+                
+            # Dynamically calculate the number of points for 5mm resolution
+            num_points = max(2, int(math.ceil(segment_dist / 5.0)))
+            
+            # Generate the array of intermediate X coordinates
+            xs = np.linspace(x_left, x_right, num_points)
             
             # Alternate sweep directions
             iteration = int(round((y_val - y_start) / step_mm))
-            if iteration % 2 == 0:
-                waypoints.append([x_left, y_val])
-                waypoints.append([x_right, y_val])
-            else:
-                waypoints.append([x_right, y_val])
-                waypoints.append([x_left, y_val])
+            if iteration % 2 != 0:
+                xs = xs[::-1]  # Reverse the array for right-to-left sweep
+                
+            # Append every 5mm waypoint to the path
+            for x in xs:
+                waypoints.append([x, y_val])
                 
         return waypoints
 
@@ -399,6 +410,17 @@ class HeaterSimulation:
         x_uniform = np.interp(s_uniform, s, x_dense) 
         y_uniform = np.interp(s_uniform, s, y_dense)
         return np.column_stack((x_uniform, y_uniform))
+
+    @staticmethod
+    def generate_moore_path(size_mm=BED_SIZE_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM):
+        """ Generates a Moore Curve (closed-loop Hilbert variant) for continuous coverage of a square workpiece. """
+        raw_pts, order, margin, pitch = generate_dynamic_hilbert_waypoints( sample_size=size_mm, induction_radius=puck_radius, safety_clearance=margin_mm )
+        # Convert Hilbert to Moore by appending the starting point to the end
+        moore_pts = np.vstack((raw_pts, raw_pts[0]))
+        # Fillet corners for smooth gantry motion
+        fillet_r = min(3.5, pitch / 3.0)
+        smooth_waypoints = fillet_corners(moore_pts, fillet_radius=fillet_r, arc_resolution=5)
+        return smooth_waypoints
 
     def execute_path(self, waypoints, speed_min=MIN_SPEED, speed_max=MAX_SPEED, target_temp=TARGET_TEMP, voltage=70.0):
         """
@@ -612,7 +634,7 @@ class HeaterSimulation:
         return True
 
     def diagnostic_run(self, shape=ACTIVE_SHAPE):
-            """ Tests all 4 path patterns for given shape and reports final score for each. """
+            """ Tests all path patterns for given shape and reports final score for each. """
             voltage = 70.0
             scores = {}
             concentric_waypoints = self.generate_concentric_path(shape=shape)
@@ -621,13 +643,14 @@ class HeaterSimulation:
             lawnmower_waypoints = self.generate_lawnmower_path(shape=shape)
             lissajous_waypoints = self.generate_lissajous_path()
             crosshatch_waypoints = self.generate_cross_hatch_path(shape=shape)
+            moore_waypoints = self.generate_moore_path()
             b_mask = self.thermal_twin.boundary_mask == 1
             size = self.thermal_twin.size
             cx, cy = size / 2.0, size / 2.0
             y_idx, x_idx = np.ogrid[:size, :size]
             reachable_radius = self.thermal_twin.radius - MARGIN_MM
-            active_zone_mask = ((x_idx - cx)**2 + (y_idx - cy)**2) <= (reachable_radius**2)
-            for pattern_name, waypoints in [("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints)]:
+            active_zone_mask = ((x_idx - cx)**2 + (y_idx - cy)**2) <= (reachable_radius**2)         # Full test commented out for short runtimes
+            for pattern_name, waypoints in [('Hilbert', hilbert_waypoints), ('Moore', moore_waypoints)]: #[("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints)]:
                 print(f"\nStarting {pattern_name} Path Test...")
                 self.thermal_twin = ThermalTwin()
                 avg_core = float(np.mean(self.thermal_twin.grid_core[active_zone_mask]))
