@@ -555,18 +555,6 @@ class HeaterSimulation:
         x_uniform = np.interp(s_uniform, s, x_dense)
         y_uniform = np.interp(s_uniform, s, y_dense)
         return np.column_stack((x_uniform, y_uniform))
-
-    @staticmethod
-    def generate_simple_moore_path(size_mm=BED_SIZE_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM):
-        """ Generates a Moore Curve (closed-loop Hilbert variant) for continuous coverage of a square workpiece. """
-        raw_pts, order, margin, pitch = generate_dynamic_hilbert_waypoints( sample_size=size_mm, induction_radius=puck_radius, safety_clearance=margin_mm )
-        # Convert Hilbert to Moore by appending the starting point to the end
-        moore_pts = np.vstack((raw_pts, raw_pts[0]))
-        # Fillet corners for smooth gantry motion
-        fillet_r = min(3.5, pitch / 3.0)
-        smooth_waypoints = fillet_corners(moore_pts, fillet_radius=fillet_r, arc_resolution=5)
-        return smooth_waypoints
-
     @staticmethod
     def generate_moore_path(size_mm=BED_SIZE_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM):
         def generate_moore_raw_points(order):
@@ -951,7 +939,6 @@ class HeaterSimulation:
             lawnmower_waypoints = self.generate_lawnmower_path(shape=shape)
             lissajous_waypoints = self.generate_lissajous_path()
             crosshatch_waypoints = self.generate_cross_hatch_path(shape=shape)
-            simple_moore_waypoints = self.generate_simple_moore_path()
             moore_waypoints = self.generate_moore_path()
             b_mask = self.thermal_twin.boundary_mask == 1
             size = self.thermal_twin.size
@@ -959,7 +946,7 @@ class HeaterSimulation:
             y_idx, x_idx = np.ogrid[:size, :size]
             reachable_radius = self.thermal_twin.radius - MARGIN_MM
             active_zone_mask = ((x_idx - cx)**2 + (y_idx - cy)**2) <= (reachable_radius**2)         # Full test commented out for short runtimes
-            for pattern_name, waypoints in [('Hilbert', hilbert_waypoints), ('Lissajous', lissajous_waypoints), ('Moore', moore_waypoints), ('Simple Moore', simple_moore_waypoints)]: #[("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints)]:
+            for pattern_name, waypoints in [('Hilbert', hilbert_waypoints), ('Lissajous', lissajous_waypoints), ('Moore', moore_waypoints)]: #[("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints)]:
                 print(f"\nStarting {pattern_name} Path Test...")
                 self.thermal_twin = ThermalTwin()
                 avg_core = float(np.mean(self.thermal_twin.grid_core[active_zone_mask]))
@@ -997,26 +984,111 @@ class HeaterSimulation:
             self.scores = scores
             self.plot_benchmark_results(scores)
             return scores
-    def plot_benchmark_results(self, scores):
-        """ Plots a bar chart comparing the scores of different path patterns. """
+    def plot_benchmark_results(self, scores=None):
+        """Plot benchmark scores and their temperature and penalty metrics."""
+        if scores is None:
+            scores = self.scores
+        if not scores:
+            raise ValueError("No benchmark scores are available to plot.")
+
         pattern_names = list(scores.keys())
-        score_values = [scores[name]['score'] for name in pattern_names]
+        statuses = [scores[name].get("status", "UNKNOWN") for name in pattern_names]
+        colors = ["tab:green" if status == "SUCCESS" else "tab:red" for status in statuses]
 
-        plt.figure(figsize=(10, 6))
-        bars = plt.bar(pattern_names, score_values, color='skyblue')
-        plt.axhline(0, color='red', linewidth=1, linestyle='--')
-        plt.title("Benchmark Scores of Path Patterns")
-        plt.ylabel("Score")
-        plt.xlabel("Path Pattern")
-        plt.xticks(rotation=45)
-        
-        # Annotate bars with score values
-        for bar, score in zip(bars, score_values):
-            height = bar.get_height()
-            plt.annotate(f'{score:.2f}', xy=(bar.get_x() + bar.get_width() / 2, height),
-                         xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
+        def metric_values(metric):
+            return [scores[name].get(metric, np.nan) for name in pattern_names]
 
-        plt.tight_layout()
+        def annotate_bars(axis, bars, values, format_spec=".2f"):
+            for bar, value in zip(bars, values):
+                if np.isnan(value):
+                    label = "N/A"
+                    y_position = 0.0
+                else:
+                    label = format(value, format_spec)
+                    y_position = bar.get_height()
+                axis.annotate(
+                    label,
+                    xy=(bar.get_x() + bar.get_width() / 2.0, y_position),
+                    xytext=(0, 4 if y_position >= 0 else -4),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom" if y_position >= 0 else "top",
+                    fontsize=8,
+                )
+
+        fig, axes = plt.subplots(3, 2, figsize=(14, 14), sharex=True)
+        axes = axes.ravel()
+
+        score_values = metric_values("score")
+        score_bars = axes[0].bar(pattern_names, score_values, color=colors)
+        axes[0].axhline(0.0, color="black", linewidth=0.8)
+        axes[0].set_yscale("symlog", linthresh=100.0)
+        axes[0].set_title("Composite benchmark score")
+        axes[0].set_ylabel("Score (symlog scale)")
+        axes[0].annotate(
+            "Green = success; red = failure\nSafety-limit failures use score = -9999",
+            xy=(0.02, 0.02),
+            xycoords="axes fraction",
+            fontsize=8,
+        )
+        annotate_bars(axes[0], score_bars, score_values)
+
+        mean_values = metric_values("mean_temp")
+        min_values = metric_values("min_temp")
+        max_values = metric_values("max_temp")
+        x = np.arange(len(pattern_names))
+        width = 0.25
+        temperature_bars = [
+            axes[1].bar(x - width, min_values, width, label="Minimum", color="tab:blue"),
+            axes[1].bar(x, mean_values, width, label="Mean", color="tab:orange"),
+            axes[1].bar(x + width, max_values, width, label="Maximum", color="tab:red"),
+        ]
+        axes[1].axhline(TARGET_TEMP, color="tab:green", linestyle="--", label="Target")
+        axes[1].axhline(SAFTEY_MAX_TEMP, color="black", linestyle=":", label="Safety limit")
+        axes[1].set_title("Final core temperature range")
+        axes[1].set_ylabel("Temperature (°C)")
+        axes[1].legend(fontsize=8)
+        for bars, values in zip(temperature_bars, [min_values, mean_values, max_values]):
+            annotate_bars(axes[1], bars, values, ".1f")
+
+        std_values = metric_values("std_temp")
+        std_bars = axes[2].bar(pattern_names, std_values, color="tab:purple")
+        axes[2].set_title("Temperature uniformity")
+        axes[2].set_ylabel("Temperature standard deviation (°C)")
+        annotate_bars(axes[2], std_bars, std_values, ".2f")
+
+        accuracy_values = metric_values("accuracy_score")
+        accuracy_bars = axes[3].bar(pattern_names, accuracy_values, color="tab:cyan")
+        axes[3].set_title("Target-temperature accuracy")
+        axes[3].set_ylabel("Accuracy score")
+        axes[3].set_ylim(bottom=0)
+        annotate_bars(axes[3], accuracy_bars, accuracy_values, ".2f")
+
+        overshoot_values = metric_values("overshoot_penalty")
+        overshoot_bars = axes[4].bar(pattern_names, overshoot_values, color="tab:red")
+        axes[4].set_title("Safety overshoot penalty")
+        axes[4].set_ylabel("Penalty")
+        axes[4].set_ylim(bottom=0)
+        annotate_bars(axes[4], overshoot_bars, overshoot_values, ".2f")
+
+        uniformity_values = metric_values("uniformity_penalty")
+        uniformity_bars = axes[5].bar(pattern_names, uniformity_values, color="tab:brown")
+        axes[5].set_title("Uniformity penalty")
+        axes[5].set_ylabel("Penalty")
+        axes[5].set_ylim(bottom=0)
+        annotate_bars(axes[5], uniformity_bars, uniformity_values, ".2f")
+
+        for axis in axes:
+            axis.grid(axis="y", linestyle=":", alpha=0.4)
+            axis.set_axisbelow(True)
+            axis.set_xticks(x)
+            axis.set_xticklabels(pattern_names)
+            axis.tick_params(axis="x", rotation=30)
+
+        axes[4].set_xlabel("Path pattern")
+        axes[5].set_xlabel("Path pattern")
+        fig.suptitle("Thermal path benchmark comparison", fontsize=16)
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
         plt.show()
 
 heater_Sim = HeaterSimulation()
