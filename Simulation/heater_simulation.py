@@ -825,11 +825,9 @@ class HeaterSimulation:
         std_temp = float(np.std(core_temps))
 
         if max_temp > max_saftey_temp:
-            return {
-                "score": -9999.0,
-                "status": "FAILURE: SAFTEY MAX TEMP EXCEEDED",
-                "max_temp": max_temp,
-            }
+            score_penalty = (max_temp - max_saftey_temp) * 100.0
+        else:
+            score_penalty = 0.0
 
         mae = np.mean(np.abs(core_temps - target_temp))
         accuracy_score = 100.0 * np.exp(-mae / 10.0)
@@ -839,8 +837,16 @@ class HeaterSimulation:
 
         uniformity_penalty = std_temp * 2.0
 
-        final_score = accuracy_score - overshoot_penalty - uniformity_penalty
-        status = "SUCCESS" if final_score > 0 else "FAILURE: LOW SCORE"
+        final_score = accuracy_score - overshoot_penalty - uniformity_penalty - score_penalty
+        if final_score < 0.0:
+            if max_temp > max_saftey_temp:
+                status = "FAIL: Safety Limit Exceeded"
+            else:
+                status = "FAIL: Poor Uniformity"
+        elif final_score < 50.0:
+            status = "WARNING: Suboptimal Heating"
+        else:
+            status = "SUCCESS: Optimal Heating"
         return {
             "score": round(final_score, 2),
             "status": status,
@@ -850,6 +856,7 @@ class HeaterSimulation:
             "std_temp": round(std_temp, 2),
             "accuracy_score": round(accuracy_score, 2),
             "overshoot_penalty": round(overshoot_penalty, 2),
+            "score_penalty": round(score_penalty, 2),
             "uniformity_penalty": round(uniformity_penalty, 2)
         }
 
@@ -945,8 +952,8 @@ class HeaterSimulation:
             cx, cy = size / 2.0, size / 2.0
             y_idx, x_idx = np.ogrid[:size, :size]
             reachable_radius = self.thermal_twin.radius - MARGIN_MM
-            active_zone_mask = ((x_idx - cx)**2 + (y_idx - cy)**2) <= (reachable_radius**2)         # Full test commented out for short runtimes
-            for pattern_name, waypoints in [('Hilbert', hilbert_waypoints), ('Lissajous', lissajous_waypoints), ('Moore', moore_waypoints)]: #[("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints)]:
+            active_zone_mask = ((x_idx - cx)**2 + (y_idx - cy)**2) <= (reachable_radius**2)         # Full test commented out for short runtimes [('Hilbert', hilbert_waypoints), ('Lissajous', lissajous_waypoints), ('Moore', moore_waypoints)]:
+            for pattern_name, waypoints in [("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints), ("Moore", moore_waypoints)]:
                 print(f"\nStarting {pattern_name} Path Test...")
                 self.thermal_twin = ThermalTwin()
                 avg_core = float(np.mean(self.thermal_twin.grid_core[active_zone_mask]))
