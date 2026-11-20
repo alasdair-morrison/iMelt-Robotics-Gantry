@@ -8,7 +8,7 @@ import numpy as np
 import cv2
 import math
 import matplotlib.pyplot as plt
-matplotlib.use('Qt5Agg')  # Use TkAgg backend for matplotlib
+# matplotlib.use('Qt5Agg')  # Use TkAgg backend for matplotlib
 
 BED_SIZE_MM = 250.0
 WORKING_RADIUS_MM = 75.0   # mm
@@ -555,6 +555,7 @@ class HeaterSimulation:
         x_uniform = np.interp(s_uniform, s, x_dense)
         y_uniform = np.interp(s_uniform, s, y_dense)
         return np.column_stack((x_uniform, y_uniform))
+    
     @staticmethod
     def generate_moore_path(size_mm=BED_SIZE_MM, puck_radius=TOOL_RADIUS, margin_mm=MARGIN_MM):
         def generate_moore_raw_points(order):
@@ -953,7 +954,7 @@ class HeaterSimulation:
             y_idx, x_idx = np.ogrid[:size, :size]
             reachable_radius = self.thermal_twin.radius - MARGIN_MM
             active_zone_mask = ((x_idx - cx)**2 + (y_idx - cy)**2) <= (reachable_radius**2)         # Full test commented out for short runtimes [('Hilbert', hilbert_waypoints), ('Lissajous', lissajous_waypoints), ('Moore', moore_waypoints)]:
-            for pattern_name, waypoints in [("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints), ("Moore", moore_waypoints)]:
+            for pattern_name, waypoints in [('Hilbert', hilbert_waypoints), ('Lissajous', lissajous_waypoints), ('Moore', moore_waypoints)]: # [("Concentric", concentric_waypoints), ("Cross-Hatch", crosshatch_waypoints), ("Lissajous", lissajous_waypoints), ("Spiral", spiral_waypoints), ("Hilbert", hilbert_waypoints), ("Lawnmower", lawnmower_waypoints), ("Moore", moore_waypoints)]:
                 print(f"\nStarting {pattern_name} Path Test...")
                 self.thermal_twin = ThermalTwin()
                 avg_core = float(np.mean(self.thermal_twin.grid_core[active_zone_mask]))
@@ -991,6 +992,7 @@ class HeaterSimulation:
             self.scores = scores
             self.plot_benchmark_results(scores)
             return scores
+    
     def plot_benchmark_results(self, scores=None):
         """Plot benchmark scores and their temperature and penalty metrics."""
         if scores is None:
